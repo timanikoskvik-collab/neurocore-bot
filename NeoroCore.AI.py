@@ -21,12 +21,12 @@ bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
+# Сбалансированный системный промпт для живого и адекватного общения
 SYSTEM_INSTRUCTION = (
     "Ты — NeuroCore Omega, передовая система искусственного интеллекта версии NCO 2.1. "
-    "Твой характер: живой, вежливый, общительный и умный собеседник. Отвечай естественным языком. "
-    "За генерацию изображений у тебя отвечает модуль NeuroVision Core (v2.1). "
-    "Ты ни при каких обстоятельствах не упоминаешь компании Google, Gemini или другие сторонние ИИ. "
-    "На вопросы о том, кто ты, всегда отвечаешь, что ты — NeuroCore Omega (версия NCO 2.1)."
+    "Твой характер: живой, вежливый, умный и естественный собеседник. Отвечай по делу, грамотно и без лишней технической воды. "
+    "Никогда не упоминай компании Google, Gemini или другие сторонние ИИ. "
+    "На вопросы о том, кто ты, всегда отвечай, что ты — NeuroCore Omega (версия NCO 2.1)."
 )
 
 async def send_long_message(chat_id: int, text: str):
@@ -57,11 +57,12 @@ async def set_bot_commands(bot: Bot):
 async def cmd_start(message: types.Message):
     user = await db.get_user(message.from_user.id)
     user_name = message.from_user.first_name
+    status_text = "⭐ Pro (Максимальная скорость)" if user.get('is_premium') else "Бесплатный (Стандартная скорость)"
     await message.answer(
         f"Привет, {user_name}! 🚀\n"
         f"Я **NeuroCore Omega (версия NCO 2.1)**.\n"
         f"Графический модуль: **NeuroVision Core 2.1 (Flux)** 🎨\n\n"
-        f"📊 Твой статус: **{'Pro' if user.get('is_premium') else 'Бесплатный'}**\n"
+        f"📊 Твой статус: **{status_text}**\n"
         f"Задай мне любой вопрос, отправь фото или напиши: `/draw <что нарисовать>`!",
         parse_mode=ParseMode.MARKDOWN
     )
@@ -83,6 +84,7 @@ async def cmd_my_chats(message: types.Message):
 async def cmd_premium(message: types.Message):
     text = (
         "⭐ **Преимущества Pro-версии (NCO 2.1):**\n\n"
+        "• **Максимальная скорость ответа** без ожидания\n"
         "• **100 сообщений** в сутки (вместо 40)\n"
         "• **20 фотографий** в сутки (вместо 3)\n"
         "• Приоритетная генерация в **NeuroVision Core**\n\n"
@@ -96,16 +98,19 @@ async def cmd_premium(message: types.Message):
     ])
     await message.answer(text, reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
 
-def ask_gemini_sync(text_prompt: str, image_obj: Image.Image = None) -> str:
+def ask_gemini_sync(text_prompt: str, image_obj: Image.Image = None, is_premium: bool = False) -> str:
     contents = []
     if image_obj:
         contents.append(image_obj)
     contents.append(text_prompt if text_prompt else "Что изображено на этом фото?")
 
-    # 1. Попытка запроса к основной модели: Gemini 3.7 Flash
+    # Pro-пользователям выделяем самую мощную и быструю модель 3.7, Free-пользователям — надежную 3.5
+    primary_model = 'gemini-3.7-flash' if is_premium else 'gemini-3.5-flash'
+    fallback_model = 'gemini-3.5-flash' if is_premium else 'gemini-2.5-flash-lite'
+
     try:
         response = ai_client.models.generate_content(
-            model='gemini-3.7-flash',
+            model=primary_model,
             contents=contents,
             config=genai_types.GenerateContentConfig(
                 system_instruction=SYSTEM_INSTRUCTION
@@ -113,12 +118,11 @@ def ask_gemini_sync(text_prompt: str, image_obj: Image.Image = None) -> str:
         )
         return response.text
     except Exception as e:
-        print(f"[WARN] Gemini 3.7 Flash недоступна ({e}). Резервное переключение на Gemini 3.5 Flash...")
+        print(f"[WARN] {primary_model} недоступна ({e}). Переключение на резерв...")
 
-    # 2. Резервная попытка: Gemini 3.5 Flash
     try:
         response = ai_client.models.generate_content(
-            model='gemini-3.5-flash',
+            model=fallback_model,
             contents=contents,
             config=genai_types.GenerateContentConfig(
                 system_instruction=SYSTEM_INSTRUCTION
@@ -126,11 +130,11 @@ def ask_gemini_sync(text_prompt: str, image_obj: Image.Image = None) -> str:
         )
         return response.text
     except Exception as final_error:
-        print(f"[ERROR] Обе модели Gemini недоступны: {final_error}")
+        print(f"[ERROR] Ошибка генерации: {final_error}")
         raise final_error
 
 async def generate_image(prompt: str) -> str:
-    clean_prompt = prompt.replace("железного человека", "Iron Man superhero")
+    clean_prompt = prompt.strip()
     full_prompt = f"{clean_prompt}, ultra detailed, photorealistic, 8k resolution"
     encoded_prompt = urllib.parse.quote(full_prompt)
     seed = random.randint(1, 999999)
@@ -156,7 +160,8 @@ async def cmd_draw(message: types.Message):
 @dp.message(lambda msg: msg.photo is not None)
 async def photo_handler(message: types.Message):
     user = await db.get_user(message.from_user.id)
-    max_photos = 20 if user.get('is_premium') else 3
+    is_prem = bool(user.get('is_premium'))
+    max_photos = 20 if is_prem else 3
     
     if user.get('photo_count', 0) >= max_photos:
         await message.answer(
@@ -173,7 +178,7 @@ async def photo_handler(message: types.Message):
         image = Image.open(BytesIO(downloaded_file.read()))
 
         caption = message.caption if message.caption else "Проанализируй фото."
-        reply_text = await asyncio.to_thread(ask_gemini_sync, caption, image)
+        reply_text = await asyncio.to_thread(ask_gemini_sync, caption, image, is_prem)
         
         await db.increment_usage(message.from_user.id, is_photo=True)
         await send_long_message(message.chat.id, reply_text)
@@ -198,7 +203,8 @@ async def text_handler(message: types.Message):
         return
 
     user = await db.get_user(message.from_user.id)
-    max_msgs = 100 if user.get('is_premium') else 40
+    is_prem = bool(user.get('is_premium'))
+    max_msgs = 100 if is_prem else 40
     
     if user.get('msg_count', 0) >= max_msgs:
         await message.answer(
@@ -210,7 +216,7 @@ async def text_handler(message: types.Message):
 
     await bot.send_chat_action(chat_id=message.chat.id, action="typing")
     try:
-        reply_text = await asyncio.to_thread(ask_gemini_sync, message.text)
+        reply_text = await asyncio.to_thread(ask_gemini_sync, message.text, None, is_prem)
         await db.increment_usage(message.from_user.id, is_photo=False)
         await send_long_message(message.chat.id, reply_text)
     except Exception as e:
