@@ -2,6 +2,7 @@ import os
 import random
 import asyncio
 import urllib.parse
+import traceback
 from io import BytesIO
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.enums import ParseMode
@@ -23,9 +24,14 @@ ai_client = genai.Client(api_key=GEMINI_API_KEY)
 SYSTEM_INSTRUCTION = (
     "Ты — искусственный интеллект-собеседник. "
     "Отвечай вежливо, грамотно, по делу и естественным человеческим языком. "
-    "Никогда не упоминай компании Google, Gemini или другие сторонние ИИ. "
+    "Никогда не упоминай компании Google или другие сторонние разработчики. "
     "Не пиши шаблонные фразы про 'мои системы работают отлично'. Общайся как умный помощник."
 )
+
+def format_error_code(err_type: str, exception: Exception) -> str:
+    """Генерирует зашифрованный код ошибки для отладки"""
+    err_hash = abs(hash(str(exception))) % 10000
+    return f"⚠️ [NCO-{err_type} | REF: {err_hash:04d}] Системный узел временно недоступен. Повторите запрос."
 
 async def send_long_message(chat_id: int, text: str):
     max_length = 4000
@@ -58,7 +64,7 @@ async def cmd_start(message: types.Message):
     user_name = message.from_user.first_name
     
     version_name = "NCO 3.1 (Pro)" if is_prem else "NCO 2.1 (Бесплатный)"
-    status_text = "⭐ Pro (Максимальная скорость, Gemini 3.7 Flash)" if is_prem else "Бесплатный (Стандартная скорость, Gemini 3.5 Flash)"
+    status_text = "⭐ Pro (Максимальная скорость)" if is_prem else "Бесплатный (Стандартная скорость)"
     
     await message.answer(
         f"Привет, {user_name}! 🚀\n"
@@ -95,7 +101,7 @@ async def cmd_my_chats(message: types.Message):
 async def cmd_premium(message: types.Message):
     text = (
         "⭐ **Преимущества Pro-версии (NCO 3.1):**\n\n"
-        "• Работа на флагманской модели **Gemini 3.7 Flash** (максимальная скорость)\n"
+        "• Работа на флагманской модели (максимальная скорость)\n"
         "• **100 сообщений** в сутки (вместо 40)\n"
         "• **20 фотографий** в сутки (вместо 3)\n"
         "• Приоритетная генерация картинок\n\n"
@@ -140,7 +146,7 @@ async def cb_buy_premium(callback: types.CallbackQuery):
     
     await callback.message.answer_invoice(
         title=title,
-        description="Переход на NCO 3.1 (Gemini 3.7 Flash), снятие лимитов и ускоренная генерация.",
+        description="Переход на NCO 3.1, снятие лимитов и ускоренная генерация.",
         prices=prices,
         provider_token="", 
         payload=f"premium_{callback.data}",
@@ -156,7 +162,7 @@ async def successful_payment(message: types.Message):
     await db.set_premium(message.from_user.id, True)
     await message.answer(
         "🎉 **Оплата прошла успешно!**\n"
-        "Вам активирован **NCO 3.1 (Pro)** на базе Gemini 3.7 Flash. Скорость и лимиты максимальные! 🚀",
+        "Вам активирован **NCO 3.1 (Pro)**. Скорость и лимиты максимальные! 🚀",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -183,7 +189,7 @@ def ask_gemini_sync(text_prompt: str, image_obj: Image.Image = None, is_premium:
         )
         return response.text
     except Exception as e:
-        print(f"[WARN] {primary_model} недоступна ({e}). Переключение на резерв...")
+        print(f"[WARN 503] {primary_model} error: {e}")
 
     try:
         response = ai_client.models.generate_content(
@@ -195,7 +201,7 @@ def ask_gemini_sync(text_prompt: str, image_obj: Image.Image = None, is_premium:
         )
         return response.text
     except Exception as final_error:
-        print(f"[ERROR] Ошибка генерации: {final_error}")
+        print(f"[ERROR 503] Fallback failed: {final_error}")
         raise final_error
 
 async def generate_image(prompt: str) -> str:
@@ -232,8 +238,9 @@ async def cmd_draw(message: types.Message):
         image_url = await generate_image(prompt)
         await message.answer_photo(photo=image_url, caption=f"🎨 **NeuroVision Core (Flux)**\n🖼 **Запрос:** _{prompt}_", parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
+        err_msg = format_error_code("404-IMG", e)
         print(f"[ERROR-DRAW] {e}")
-        await message.answer("⚠️ Не удалось сгенерировать изображение.")
+        await message.answer(err_msg)
 
 @dp.message(lambda msg: msg.photo is not None)
 async def photo_handler(message: types.Message):
@@ -244,7 +251,7 @@ async def photo_handler(message: types.Message):
     
     if user.get('photo_count', 0) >= max_photos:
         await message.answer(
-            f"⚠️ **Лимит исчерпан**\n"
+            f"⚠️ **Лимит исчерпан [NCO-429]**\n"
             f"Вы исчерпали суточный лимит загрузки изображений ({max_photos}/{max_photos}).\n"
             f"Лимит обновится через 24 часа или оформите /premium."
         )
@@ -270,8 +277,9 @@ async def photo_handler(message: types.Message):
         
         await send_long_message(message.chat.id, f"*[Обработано через {version_label}]*\n\n{reply_text}")
     except Exception as e:
+        err_msg = format_error_code("503-VISION", e)
         print(f"[ERROR-IMAGE] {e}")
-        await message.answer("⚠️ Сервер нейросети временно перегружен. Повторите попытку через пару минут.")
+        await message.answer(err_msg)
 
 @dp.message()
 async def text_handler(message: types.Message):
@@ -286,8 +294,9 @@ async def text_handler(message: types.Message):
             image_url = await generate_image(prompt)
             await message.answer_photo(photo=image_url, caption=f"🎨 **NeuroVision Core (Flux)**\n🖼 **Запрос:** _{prompt}_", parse_mode=ParseMode.MARKDOWN)
         except Exception as e:
+            err_msg = format_error_code("404-IMG", e)
             print(f"[ERROR-DRAW] {e}")
-            await message.answer("⚠️ Не удалось сгенерировать изображение.")
+            await message.answer(err_msg)
         return
 
     user_id = message.from_user.id
@@ -297,7 +306,7 @@ async def text_handler(message: types.Message):
     
     if user.get('msg_count', 0) >= max_msgs:
         await message.answer(
-            f"⚠️ **Лимит исчерпан**\n"
+            f"⚠️ **Лимит исчерпан [NCO-429]**\n"
             f"Вы исчерпали суточный лимит текстовых запросов ({max_msgs}/{max_msgs}).\n"
             f"Лимит обновится через 24 часа или оформите /premium."
         )
@@ -316,8 +325,9 @@ async def text_handler(message: types.Message):
         
         await send_long_message(message.chat.id, reply_text)
     except Exception as e:
+        err_msg = format_error_code("503-TEXT", e)
         print(f"[ERROR-TEXT] {e}")
-        await message.answer("⚠️ Сервер нейросети временно перегружен. Повторите запрос через 1-2 минуты.")
+        await message.answer(err_msg)
 
 async def main():
     await db.init_db()
