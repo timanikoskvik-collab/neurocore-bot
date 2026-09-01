@@ -1,3 +1,4 @@
+import os
 import asyncio
 import urllib.parse
 from io import BytesIO
@@ -11,18 +12,18 @@ from PIL import Image
 
 import database as db
 
-TELEGRAM_TOKEN = '8870761168:AAEkUHZkfqj6Ip0kd3dwUdkufLaRS6qy8hQ'
-GEMINI_API_KEY = 'AQ.Ab8RN6LBJDlPNVLV5WuYheRfMclY25MtYHP6NaKwZzRUt6pZfw'
+# Забираем токены из безопасных переменной окружения Render
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# Инструкция характера и личности NeuroCore Omega NCO 2.1
+# Системная инструкция NeuroCore Omega NCO 2.1
 SYSTEM_INSTRUCTION = (
     "Ты — NeuroCore Omega, передовая система искусственного интеллекта версии NCO 2.1. "
-    "Твой характер: живой, вежливый, общительный и умный собеседник. Отвечай естественным языком, "
-    "без заученных робо-фраз вроде 'сервер работает функционально'. "
+    "Твой характер: живой, вежливый, общительный и умный собеседник. Отвечай естественным языком. "
     "За генерацию изображений у тебя отвечает модуль NeuroVision Core (v2.1). "
     "Ты ни при каких обстоятельствах не упоминаешь компании Google, Gemini или другие сторонние ИИ. "
     "На вопросы о том, кто ты, всегда отвечаешь, что ты — NeuroCore Omega (версия NCO 2.1)."
@@ -69,9 +70,14 @@ async def cmd_start(message: types.Message):
 async def cmd_my_chats(message: types.Message):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Создать новый чат", callback_data="new_chat")],
-        [InlineKeyboardButton(text="📌 Чат 1 (Активный)", callback_data="select_chat_1")]
+        [InlineKeyboardButton(text="📌 Чат 1 (Автосохранение)", callback_data="select_chat_1")]
     ])
-    await message.answer("💬 **Ваши диалоги:**\nВыберите чат или создайте новый:", reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
+    await message.answer(
+        "💬 **Ваши сохранённые диалоги:**\n"
+        "Все переписки сохраняются автоматически. Выберите чат для продолжения:",
+        reply_markup=keyboard,
+        parse_mode=ParseMode.MARKDOWN
+    )
 
 @dp.message(Command("premium"))
 async def cmd_premium(message: types.Message):
@@ -80,10 +86,13 @@ async def cmd_premium(message: types.Message):
         "• **100 сообщений** в сутки (вместо 40)\n"
         "• **20 фотографий** в сутки (вместо 3)\n"
         "• Приоритетная генерация в **NeuroVision Core**\n\n"
-        "Стоимость: **25 Telegram Stars** / месяц"
+        "Выберите период подписки:"
     )
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⭐ Оплатить 25 Stars", callback_data="buy_premium")]
+        [InlineKeyboardButton(text="⭐ 1 месяц — 25 Stars", callback_data="buy_premium_1")],
+        [InlineKeyboardButton(text="⭐ 3 месяца — 65 Stars (-13%)", callback_data="buy_premium_3")],
+        [InlineKeyboardButton(text="⭐ 12 месяцев — 240 Stars (-20%)", callback_data="buy_premium_12")],
+        [InlineKeyboardButton(text="⭐ 24 месяца — 420 Stars (-30%)", callback_data="buy_premium_24")]
     ])
     await message.answer(text, reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
 
@@ -94,7 +103,7 @@ def ask_gemini(text_prompt: str, image_obj: Image.Image = None) -> str:
     contents.append(text_prompt if text_prompt else "Что изображено на этом фото?")
 
     response = ai_client.models.generate_content(
-        model='gemini-3.6-flash',
+        model='gemini-2.5-flash',
         contents=contents,
         config=genai_types.GenerateContentConfig(
             system_instruction=SYSTEM_INSTRUCTION
@@ -109,7 +118,7 @@ def enhance_prompt_for_art(raw_prompt: str) -> str:
     )
     try:
         response = ai_client.models.generate_content(
-            model='gemini-3.6-flash',
+            model='gemini-2.5-flash',
             contents=raw_prompt,
             config=genai_types.GenerateContentConfig(
                 system_instruction=translator_instruction
