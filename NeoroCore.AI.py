@@ -1,4 +1,5 @@
 import os
+import random
 import asyncio
 import urllib.parse
 from io import BytesIO
@@ -12,7 +13,7 @@ from PIL import Image
 
 import database as db
 
-# Забираем токены из безопасных переменной окружения Render
+# Забираем токены из безопасных переменных окружения Render
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
@@ -20,7 +21,6 @@ bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# Системная инструкция NeuroCore Omega NCO 2.1
 SYSTEM_INSTRUCTION = (
     "Ты — NeuroCore Omega, передовая система искусственного интеллекта версии NCO 2.1. "
     "Твой характер: живой, вежливый, общительный и умный собеседник. Отвечай естественным языком. "
@@ -60,9 +60,9 @@ async def cmd_start(message: types.Message):
     await message.answer(
         f"Привет, {user_name}! 🚀\n"
         f"Я **NeuroCore Omega (версия NCO 2.1)**.\n"
-        f"Графический модуль: **NeuroVision Core 2.1** 🎨\n\n"
+        f"Графический модуль: **NeuroVision Core 2.1 (Flux Powered)** 🎨\n\n"
         f"📊 Твой статус: **{'Pro' if user.get('is_premium') else 'Бесплатный'}**\n"
-        f"Задай мне любой вопрос, отправь фото или напиши: `нарисуй <что-то>`!",
+        f"Задай мне любой вопрос, отправь фото или напиши: `/draw <что нарисовать>`!",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -102,44 +102,45 @@ def ask_gemini(text_prompt: str, image_obj: Image.Image = None) -> str:
         contents.append(image_obj)
     contents.append(text_prompt if text_prompt else "Что изображено на этом фото?")
 
-    response = ai_client.models.generate_content(
-        model='gemini-2.5-flash',
-        contents=contents,
-        config=genai_types.GenerateContentConfig(
-            system_instruction=SYSTEM_INSTRUCTION
-        )
-    )
-    return response.text
+    # Пробуем сделать запрос, в случае сбоя сети делаем повторную попытку
+    for attempt in range(2):
+        try:
+            response = ai_client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=contents,
+                config=genai_types.GenerateContentConfig(
+                    system_instruction=SYSTEM_INSTRUCTION
+                )
+            )
+            return response.text
+        except Exception as e:
+            if attempt == 1:
+                raise e
 
-def enhance_prompt_for_art(raw_prompt: str) -> str:
-    translator_instruction = (
-        "Translate the user prompt to precise English and turn it into a detailed image generation prompt. "
-        "Keep the exact meaning. Output ONLY the English prompt, nothing else."
-    )
+def translate_prompt_to_en(raw_prompt: str) -> str:
     try:
         response = ai_client.models.generate_content(
             model='gemini-2.5-flash',
-            contents=raw_prompt,
-            config=genai_types.GenerateContentConfig(
-                system_instruction=translator_instruction
-            )
+            contents=f"Translate this short image description to English for AI art generator. Output ONLY English words: {raw_prompt}"
         )
         return response.text.strip()
     except Exception:
         return raw_prompt
 
 async def generate_image(prompt: str) -> str:
-    english_prompt = await asyncio.to_thread(enhance_prompt_for_art, prompt)
-    full_prompt = f"{english_prompt}, highly detailed, 8k resolution, cinematic lighting"
+    english_prompt = await asyncio.to_thread(translate_prompt_to_en, prompt)
+    full_prompt = f"{english_prompt}, detailed, high quality, 8k"
     encoded_prompt = urllib.parse.quote(full_prompt)
-    image_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true&seed=42"
+    seed = random.randint(1, 999999)
+    # Используем модель flux для максимального качества генерации персонажей и предметов
+    image_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&model=flux&nologo=true&seed={seed}"
     return image_url
 
 @dp.message(Command("draw"))
 async def cmd_draw(message: types.Message):
     prompt = message.text.replace("/draw", "").strip()
     if not prompt:
-        await message.answer("🎨 Пожалуйста, напишите описание картинки.\nПример: `/draw космическая станция`", parse_mode=ParseMode.MARKDOWN)
+        await message.answer("🎨 Пожалуйста, напишите описание картинки.\nПример: `/draw железный человек`", parse_mode=ParseMode.MARKDOWN)
         return
 
     await message.answer("🎨 *NeuroVision Core 2.1 генерирует изображение...*", parse_mode=ParseMode.MARKDOWN)
@@ -147,7 +148,7 @@ async def cmd_draw(message: types.Message):
     
     try:
         image_url = await generate_image(prompt)
-        await message.answer_photo(photo=image_url, caption=f"🎨 **NeuroVision Core 2.1**\n🖼 **Запрос:** _{prompt}_", parse_mode=ParseMode.MARKDOWN)
+        await message.answer_photo(photo=image_url, caption=f"🎨 **NeuroVision Core 2.1 (Flux)**\n🖼 **Запрос:** _{prompt}_", parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         print(f"[ERROR-DRAW] {e}")
         await message.answer("⚠️ **Ошибка ERR-303 (NeuroVision Core)**\nНе удалось сгенерировать изображение.")
@@ -190,7 +191,7 @@ async def text_handler(message: types.Message):
         await bot.send_chat_action(chat_id=message.chat.id, action="upload_photo")
         try:
             image_url = await generate_image(prompt)
-            await message.answer_photo(photo=image_url, caption=f"🎨 **NeuroVision Core 2.1**\n🖼 **Запрос:** _{prompt}_", parse_mode=ParseMode.MARKDOWN)
+            await message.answer_photo(photo=image_url, caption=f"🎨 **NeuroVision Core 2.1 (Flux)**\n🖼 **Запрос:** _{prompt}_", parse_mode=ParseMode.MARKDOWN)
         except Exception as e:
             print(f"[ERROR-DRAW] {e}")
             await message.answer("⚠️ **Ошибка ERR-303 (NeuroVision Core)**\nНе удалось сгенерировать изображение.")
