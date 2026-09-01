@@ -60,7 +60,7 @@ async def cmd_start(message: types.Message):
     await message.answer(
         f"Привет, {user_name}! 🚀\n"
         f"Я **NeuroCore Omega (версия NCO 2.1)**.\n"
-        f"Графический модуль: **NeuroVision Core 2.1 (Flux Powered)** 🎨\n\n"
+        f"Графический модуль: **NeuroVision Core 2.1 (Flux)** 🎨\n\n"
         f"📊 Твой статус: **{'Pro' if user.get('is_premium') else 'Бесплатный'}**\n"
         f"Задай мне любой вопрос, отправь фото или напиши: `/draw <что нарисовать>`!",
         parse_mode=ParseMode.MARKDOWN
@@ -96,45 +96,45 @@ async def cmd_premium(message: types.Message):
     ])
     await message.answer(text, reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
 
-def ask_gemini(text_prompt: str, image_obj: Image.Image = None) -> str:
+def ask_gemini_sync(text_prompt: str, image_obj: Image.Image = None) -> str:
     contents = []
     if image_obj:
         contents.append(image_obj)
     contents.append(text_prompt if text_prompt else "Что изображено на этом фото?")
 
-    # Пробуем сделать запрос, в случае сбоя сети делаем повторную попытку
-    for attempt in range(2):
-        try:
-            response = ai_client.models.generate_content(
-                model='gemini-2.5-flash',
-                contents=contents,
-                config=genai_types.GenerateContentConfig(
-                    system_instruction=SYSTEM_INSTRUCTION
-                )
-            )
-            return response.text
-        except Exception as e:
-            if attempt == 1:
-                raise e
-
-def translate_prompt_to_en(raw_prompt: str) -> str:
+    # 1. Попытка запроса к основной модели: Gemini 3.7 Flash
     try:
         response = ai_client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=f"Translate this short image description to English for AI art generator. Output ONLY English words: {raw_prompt}"
+            model='gemini-3.7-flash',
+            contents=contents,
+            config=genai_types.GenerateContentConfig(
+                system_instruction=SYSTEM_INSTRUCTION
+            )
         )
-        return response.text.strip()
-    except Exception:
-        return raw_prompt
+        return response.text
+    except Exception as e:
+        print(f"[WARN] Gemini 3.7 Flash недоступна ({e}). Резервное переключение на Gemini 3.5 Flash...")
+
+    # 2. Резервная попытка: Gemini 3.5 Flash
+    try:
+        response = ai_client.models.generate_content(
+            model='gemini-3.5-flash',
+            contents=contents,
+            config=genai_types.GenerateContentConfig(
+                system_instruction=SYSTEM_INSTRUCTION
+            )
+        )
+        return response.text
+    except Exception as final_error:
+        print(f"[ERROR] Обе модели Gemini недоступны: {final_error}")
+        raise final_error
 
 async def generate_image(prompt: str) -> str:
-    english_prompt = await asyncio.to_thread(translate_prompt_to_en, prompt)
-    full_prompt = f"{english_prompt}, detailed, high quality, 8k"
+    clean_prompt = prompt.replace("железного человека", "Iron Man superhero")
+    full_prompt = f"{clean_prompt}, ultra detailed, photorealistic, 8k resolution"
     encoded_prompt = urllib.parse.quote(full_prompt)
     seed = random.randint(1, 999999)
-    # Используем модель flux для максимального качества генерации персонажей и предметов
-    image_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&model=flux&nologo=true&seed={seed}"
-    return image_url
+    return f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&model=flux&nologo=true&seed={seed}"
 
 @dp.message(Command("draw"))
 async def cmd_draw(message: types.Message):
@@ -173,7 +173,7 @@ async def photo_handler(message: types.Message):
         image = Image.open(BytesIO(downloaded_file.read()))
 
         caption = message.caption if message.caption else "Проанализируй фото."
-        reply_text = await asyncio.to_thread(ask_gemini, caption, image)
+        reply_text = await asyncio.to_thread(ask_gemini_sync, caption, image)
         
         await db.increment_usage(message.from_user.id, is_photo=True)
         await send_long_message(message.chat.id, reply_text)
@@ -210,7 +210,7 @@ async def text_handler(message: types.Message):
 
     await bot.send_chat_action(chat_id=message.chat.id, action="typing")
     try:
-        reply_text = await asyncio.to_thread(ask_gemini, message.text)
+        reply_text = await asyncio.to_thread(ask_gemini_sync, message.text)
         await db.increment_usage(message.from_user.id, is_photo=False)
         await send_long_message(message.chat.id, reply_text)
     except Exception as e:
