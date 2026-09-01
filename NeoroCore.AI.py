@@ -21,12 +21,12 @@ bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# Нормальный, живой системный промпт для NCO 3.1 (без робо-терминологии)
+# Живой и адекватный системный промпт
 SYSTEM_INSTRUCTION = (
-    "Ты — NeuroCore Omega версии NCO 3.1, передовой искусственный интеллект. "
+    "Ты — искусственный интеллект-собеседник. "
     "Отвечай вежливо, грамотно, по делу и естественным человеческим языком. "
     "Никогда не упоминай компании Google, Gemini или другие сторонние ИИ. "
-    "Не пиши шаблонные фразы про 'мои системы работают отлично' и тому подобное. Общайся как умный помощник."
+    "Не пиши шаблонные фразы про 'мои системы работают отлично'. Общайся как умный помощник."
 )
 
 async def send_long_message(chat_id: int, text: str):
@@ -47,7 +47,7 @@ async def send_long_message(chat_id: int, text: str):
 async def set_bot_commands(bot: Bot):
     commands = [
         BotCommand(command="start", description="🚀 Перезапустить бота"),
-        BotCommand(command="draw", description="🎨 Нарисовать картинку (NCO 3.1)"),
+        BotCommand(command="draw", description="🎨 Нарисовать картинку"),
         BotCommand(command="my_chats", description="💬 Мои чаты"),
         BotCommand(command="premium", description="⭐ Оформить Premium"),
     ]
@@ -56,12 +56,16 @@ async def set_bot_commands(bot: Bot):
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
     user = await db.get_user(message.from_user.id)
+    is_prem = bool(user.get('is_premium'))
     user_name = message.from_user.first_name
-    status_text = "⭐ Pro (Максимальная скорость)" if user.get('is_premium') else "Бесплатный (Стандартная скорость)"
+    
+    version_name = "NCO 3.1 (Pro)" if is_prem else "NCO 2.1 (Бесплатный)"
+    status_text = "⭐ Pro (Максимальная скорость, Gemini 3.7 Flash)" if is_prem else "Бесплатный (Стандартная скорость, Gemini 3.5 Flash)"
+    
     await message.answer(
         f"Привет, {user_name}! 🚀\n"
-        f"Я **NeuroCore Omega (версия NCO 3.1)**.\n"
-        f"Графический модуль: **NeuroVision Core 3.1 (Flux)** 🎨\n\n"
+        f"Я **NeuroCore Omega (версия {version_name})**.\n"
+        f"Графический модуль: **NeuroVision Core (Flux)** 🎨\n\n"
         f"📊 Твой статус: **{status_text}**\n"
         f"Задай мне любой вопрос, отправь фото или напиши: `/draw <что нарисовать>`!",
         parse_mode=ParseMode.MARKDOWN
@@ -84,10 +88,10 @@ async def cmd_my_chats(message: types.Message):
 async def cmd_premium(message: types.Message):
     text = (
         "⭐ **Преимущества Pro-версии (NCO 3.1):**\n\n"
-        "• **Максимальная скорость ответа** без ожидания\n"
+        "• Работа на флагманской модели **Gemini 3.7 Flash** (максимальная скорость)\n"
         "• **100 сообщений** в сутки (вместо 40)\n"
         "• **20 фотографий** в сутки (вместо 3)\n"
-        "• Приоритетная генерация в **NeuroVision Core 3.1**\n\n"
+        "• Приоритетная генерация картинок\n\n"
         "Выберите период подписки для оплаты через Telegram Stars:"
     )
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -112,7 +116,7 @@ async def cb_select_chat(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("buy_"))
 async def cb_buy_premium(callback: types.CallbackQuery):
-    await callback.answer() # Снимает значок загрузки с кнопки
+    await callback.answer() 
     
     prices_map = {
         "buy_1": ("Pro подписка NCO 3.1 (1 месяц)", 25),
@@ -126,9 +130,9 @@ async def cb_buy_premium(callback: types.CallbackQuery):
     
     await callback.message.answer_invoice(
         title=title,
-        description="Мгновенное снятие лимитов, максимальная скорость ответов NCO 3.1 и приоритетный доступ.",
+        description="Переход на NCO 3.1 (Gemini 3.7 Flash), снятие лимитов и ускоренная генерация.",
         prices=prices,
-        provider_token="", # Пустая строка для цифровых товаров / Telegram Stars
+        provider_token="", 
         payload=f"premium_{callback.data}",
         currency="XTR",
     )
@@ -142,11 +146,11 @@ async def successful_payment(message: types.Message):
     await db.set_premium(message.from_user.id, True)
     await message.answer(
         "🎉 **Оплата прошла успешно!**\n"
-        "Вам активирован **Pro-статус NCO 3.1**. Все лимиты расширены, а скорость максимальная! 🚀",
+        "Вам активирован **NCO 3.1 (Pro)** на базе Gemini 3.7 Flash. Скорость и лимиты максимальные! 🚀",
         parse_mode=ParseMode.MARKDOWN
     )
 
-# --- ЛОГИКА ГЕНЕРАЦИИ (GEMINI) ---
+# --- ЛОГИКА ГЕНЕРАЦИИ (GEMINI 3.7 для Pro, Gemini 3.5 для Free) ---
 
 def ask_gemini_sync(text_prompt: str, image_obj: Image.Image = None, is_premium: bool = False) -> str:
     contents = []
@@ -154,6 +158,7 @@ def ask_gemini_sync(text_prompt: str, image_obj: Image.Image = None, is_premium:
         contents.append(image_obj)
     contents.append(text_prompt if text_prompt else "Что изображено на этом фото?")
 
+    # Pro -> NCO 3.1 (Gemini 3.7 Flash), Free -> NCO 2.1 (Gemini 3.5 Flash)
     primary_model = 'gemini-3.7-flash' if is_premium else 'gemini-3.5-flash'
     fallback_model = 'gemini-3.5-flash' if is_premium else 'gemini-2.5-flash-lite'
 
@@ -183,9 +188,13 @@ def ask_gemini_sync(text_prompt: str, image_obj: Image.Image = None, is_premium:
         raise final_error
 
 async def generate_image(prompt: str) -> str:
-    clean_prompt = prompt.strip()
-    full_prompt = f"{clean_prompt}, ultra detailed, photorealistic, 8k resolution"
-    encoded_prompt = urllib.parse.quote(full_prompt)
+    clean_prompt = prompt.lower().strip()
+    if "железного человека" in clean_prompt or "железный человек" in clean_prompt:
+        translated_prompt = "Iron Man superhero in mechanical suit, cinematic lighting"
+    else:
+        translated_prompt = f"{prompt}, highly detailed, cinematic lighting, 8k resolution"
+
+    encoded_prompt = urllib.parse.quote(translated_prompt)
     seed = random.randint(1, 999999)
     return f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&model=flux&nologo=true&seed={seed}"
 
@@ -193,15 +202,24 @@ async def generate_image(prompt: str) -> str:
 async def cmd_draw(message: types.Message):
     prompt = message.text.replace("/draw", "").strip()
     if not prompt:
-        await message.answer("🎨 Пожалуйста, напишите описание картинки.\nПример: `/draw железный человек`", parse_mode=ParseMode.MARKDOWN)
+        await message.answer(
+            "🎨 **Как пользоваться генератором картинок:**\n\n"
+            "Напишите команду `/draw` и укажите, что именно нужно нарисовать.\n\n"
+            "**Примеры:**\n"
+            "• `/draw киберпанк город`\n"
+            "• `/draw футуристический автомобиль`\n"
+            "• `/draw милый котик в космосе`",
+            parse_mode=ParseMode.MARKDOWN
+        )
         return
 
-    await message.answer("🎨 *NeuroVision Core 3.1 генерирует изображение...*", parse_mode=ParseMode.MARKDOWN)
+    version_label = "NCO 3.1 Pro" if (await db.get_user(message.from_user.id)).get('is_premium') else "NCO 2.1"
+    await message.answer(f"🎨 *NeuroVision Core ({version_label}) генерирует изображение...*", parse_mode=ParseMode.MARKDOWN)
     await bot.send_chat_action(chat_id=message.chat.id, action="upload_photo")
     
     try:
         image_url = await generate_image(prompt)
-        await message.answer_photo(photo=image_url, caption=f"🎨 **NeuroVision Core 3.1 (Flux)**\n🖼 **Запрос:** _{prompt}_", parse_mode=ParseMode.MARKDOWN)
+        await message.answer_photo(photo=image_url, caption=f"🎨 **NeuroVision Core (Flux)**\n🖼 **Запрос:** _{prompt}_", parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         print(f"[ERROR-DRAW] {e}")
         await message.answer("⚠️ Не удалось сгенерировать изображение.")
@@ -220,6 +238,7 @@ async def photo_handler(message: types.Message):
         )
         return
 
+    version_label = "NCO 3.1 Pro" if is_prem else "NCO 2.1"
     await bot.send_chat_action(chat_id=message.chat.id, action="typing")
     try:
         photo_file = await bot.get_file(message.photo[-1].file_id)
@@ -230,7 +249,7 @@ async def photo_handler(message: types.Message):
         reply_text = await asyncio.to_thread(ask_gemini_sync, caption, image, is_prem)
         
         await db.increment_usage(message.from_user.id, is_photo=True)
-        await send_long_message(message.chat.id, reply_text)
+        await send_long_message(message.chat.id, f"*[Обработано через {version_label}]*\n\n{reply_text}")
     except Exception as e:
         print(f"[ERROR-IMAGE] {e}")
         await message.answer("⚠️ Сервер нейросети временно перегружен. Повторите попытку через пару минут.")
@@ -241,11 +260,12 @@ async def text_handler(message: types.Message):
     
     if text_lower.startswith("нарисуй ") or text_lower.startswith("сгенерируй "):
         prompt = message.text.split(" ", 1)[1]
-        await message.answer("🎨 *NeuroVision Core 3.1 генерирует изображение...*", parse_mode=ParseMode.MARKDOWN)
+        version_label = "NCO 3.1 Pro" if (await db.get_user(message.from_user.id)).get('is_premium') else "NCO 2.1"
+        await message.answer(f"🎨 *NeuroVision Core ({version_label}) генерирует изображение...*", parse_mode=ParseMode.MARKDOWN)
         await bot.send_chat_action(chat_id=message.chat.id, action="upload_photo")
         try:
             image_url = await generate_image(prompt)
-            await message.answer_photo(photo=image_url, caption=f"🎨 **NeuroVision Core 3.1 (Flux)**\n🖼 **Запрос:** _{prompt}_", parse_mode=ParseMode.MARKDOWN)
+            await message.answer_photo(photo=image_url, caption=f"🎨 **NeuroVision Core (Flux)**\n🖼 **Запрос:** _{prompt}_", parse_mode=ParseMode.MARKDOWN)
         except Exception as e:
             print(f"[ERROR-DRAW] {e}")
             await message.answer("⚠️ Не удалось сгенерировать изображение.")
@@ -275,7 +295,7 @@ async def text_handler(message: types.Message):
 async def main():
     await db.init_db()
     await set_bot_commands(bot)
-    print("NeuroCore Omega (NCO 3.1) успешно запущен!")
+    print("NeuroCore Omega успешно запущен!")
     await dp.start_polling(bot)
 
 if __name__ == '__main__':
