@@ -67,7 +67,7 @@ async def cmd_start(message: types.Message):
     await message.answer(
         f"Привет, {user_name}! 🚀\n"
         f"Я **NeuroCore Omega (версия {version_name})**.\n"
-        f"Графический модуль: **NeuroVision Core (Flux)** 🎨\n\n"
+        f"Графический модуль: **NeuroVision Core** 🎨\n\n"
         f"📊 Твой статус: **{status_text}**\n"
         f"Задай мне любой вопрос, отправь фото или напиши: `/draw <что нарисовать>`!",
         parse_mode=ParseMode.MARKDOWN
@@ -165,32 +165,21 @@ async def successful_payment(message: types.Message):
     )
 
 def ask_gemini_sync(text_prompt: str, image_obj: Image.Image = None, is_premium: bool = False, history: list = None) -> str:
-    contents = []
-    
+    full_prompt = ""
     if history:
         for role, text in history:
-            api_role = "user" if role == "user" else "model"
-            contents.append({
-                "role": api_role,
-                "parts": [{"text": text}]
-            })
+            prefix = "User: " if role == "user" else "Model: "
+            full_prompt += f"{prefix}{text}\n"
     
-    current_parts = []
-    if image_obj:
-        current_parts.append(image_obj)
-    current_parts.append(text_prompt if text_prompt else "Что изображено на этом фото?")
-    
-    contents.append({
-        "role": "user",
-        "parts": current_parts
-    })
+    full_prompt += f"User: {text_prompt if text_prompt else 'Привет'}"
 
-    primary_model = 'gemini-2.5-flash'
-    fallback_model = 'gemini-2.5-flash-lite'
+    contents = [full_prompt]
+    if image_obj:
+        contents.append(image_obj)
 
     try:
         response = ai_client.models.generate_content(
-            model=primary_model,
+            model='gemini-2.5-flash',
             contents=contents,
             config=genai_types.GenerateContentConfig(
                 system_instruction=SYSTEM_INSTRUCTION
@@ -198,11 +187,11 @@ def ask_gemini_sync(text_prompt: str, image_obj: Image.Image = None, is_premium:
         )
         return response.text
     except Exception as e:
-        print(f"[WARN 503] Primary model error: {e}")
+        print(f"[WARN 503] Primary error: {e}")
 
     try:
         response = ai_client.models.generate_content(
-            model=fallback_model,
+            model='gemini-2.5-flash-lite',
             contents=contents,
             config=genai_types.GenerateContentConfig(
                 system_instruction=SYSTEM_INSTRUCTION
@@ -210,14 +199,13 @@ def ask_gemini_sync(text_prompt: str, image_obj: Image.Image = None, is_premium:
         )
         return response.text
     except Exception as final_error:
-        print(f"[ERROR 503] Fallback failed: {final_error}")
+        print(f"[ERROR 503] Fallback error: {final_error}")
         raise final_error
 
 async def generate_image(prompt: str) -> str:
-    translated_prompt = f"{prompt}, highly detailed, cinematic lighting, 8k resolution"
-    encoded_prompt = urllib.parse.quote(translated_prompt)
+    encoded_prompt = urllib.parse.quote(prompt)
     seed = random.randint(1, 999999)
-    return f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&model=flux&nologo=true&seed={seed}"
+    return f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true&seed={seed}"
 
 @dp.message(Command("draw"))
 async def cmd_draw(message: types.Message):
@@ -240,7 +228,7 @@ async def cmd_draw(message: types.Message):
     
     try:
         image_url = await generate_image(prompt)
-        await message.answer_photo(photo=image_url, caption=f"🎨 **NeuroVision Core (Flux)**\n🖼 **Запрос:** _{prompt}_", parse_mode=ParseMode.MARKDOWN)
+        await message.answer_photo(photo=image_url, caption=f"🎨 **NeuroVision Core**\n🖼 **Запрос:** _{prompt}_", parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         err_msg = format_error_code("404-IMG", e)
         print(f"[ERROR-DRAW] {e}")
@@ -296,7 +284,7 @@ async def text_handler(message: types.Message):
         await bot.send_chat_action(chat_id=message.chat.id, action="upload_photo")
         try:
             image_url = await generate_image(prompt)
-            await message.answer_photo(photo=image_url, caption=f"🎨 **NeuroVision Core (Flux)**\n🖼 **Запрос:** _{prompt}_", parse_mode=ParseMode.MARKDOWN)
+            await message.answer_photo(photo=image_url, caption=f"🎨 **NeuroVision Core**\n🖼 **Запрос:** _{prompt}_", parse_mode=ParseMode.MARKDOWN)
         except Exception as e:
             err_msg = format_error_code("404-IMG", e)
             print(f"[ERROR-DRAW] {e}")
