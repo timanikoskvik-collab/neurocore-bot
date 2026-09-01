@@ -13,7 +13,6 @@ from PIL import Image
 
 import database as db
 
-# Забираем токены из переменных окружения
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
@@ -21,7 +20,6 @@ bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# Живой и адекватный системный промпт
 SYSTEM_INSTRUCTION = (
     "Ты — искусственный интеллект-собеседник. "
     "Отвечай вежливо, грамотно, по делу и естественным человеческим языком. "
@@ -73,10 +71,19 @@ async def cmd_start(message: types.Message):
 
 @dp.message(Command("my_chats"))
 async def cmd_my_chats(message: types.Message):
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Создать новый чат", callback_data="new_chat")],
-        [InlineKeyboardButton(text="📌 Чат 1 (Основной)", callback_data="select_chat_1")]
-    ])
+    user_id = message.from_user.id
+    chats = await db.get_user_chats(user_id)
+    
+    keyboard_buttons = [
+        [InlineKeyboardButton(text="➕ Создать новый чат", callback_data="new_chat")]
+    ]
+    
+    for chat_id, title in chats:
+        keyboard_buttons.append([
+            InlineKeyboardButton(text=f"📌 {title}", callback_data=f"select_chat_{chat_id}")
+        ])
+        
+    keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
     await message.answer(
         "💬 **Ваши сохранённые диалоги:**\n"
         "Все переписки сохраняются автоматически. Выберите чат для продолжения:",
@@ -102,17 +109,20 @@ async def cmd_premium(message: types.Message):
     ])
     await message.answer(text, reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
 
-# --- ОБРАБОТЧИКИ КНОПОК И ОПЛАТЫ ---
-
 @dp.callback_query(F.data == "new_chat")
 async def cb_new_chat(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    new_chat_id = await db.create_new_chat(user_id, "Новый сеанс")
     await callback.answer("Создан новый чат!")
-    await callback.message.answer("💬 История диалога очищена. О чем поговорим?")
+    await callback.message.answer(f"💬 Создан чат #{new_chat_id}. История диалога очищена. О чем поговорим?")
 
-@dp.callback_query(F.data == "select_chat_1")
+@dp.callback_query(F.data.startswith("select_chat_"))
 async def cb_select_chat(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    chat_id = int(callback.data.split("_")[-1])
+    await db.set_active_chat(user_id, chat_id)
     await callback.answer("Чат открыт!")
-    await callback.message.answer("📌 Вы переключены в «Чат 1». Продолжайте общение!")
+    await callback.message.answer(f"📌 Вы переключены в сеанс #{chat_id}. Продолжайте общение!")
 
 @dp.callback_query(F.data.startswith("buy_"))
 async def cb_buy_premium(callback: types.CallbackQuery):
@@ -150,15 +160,16 @@ async def successful_payment(message: types.Message):
         parse_mode=ParseMode.MARKDOWN
     )
 
-# --- ЛОГИКА ГЕНЕРАЦИИ (GEMINI 3.7 для Pro, Gemini 3.5 для Free) ---
-
-def ask_gemini_sync(text_prompt: str, image_obj: Image.Image = None, is_premium: bool = False) -> str:
+def ask_gemini_sync(text_prompt: str, image_obj: Image.Image = None, is_premium: bool = False, history: list = None) -> str:
     contents = []
+    if history:
+        for role, text in history:
+            contents.append(text)
+    
     if image_obj:
         contents.append(image_obj)
     contents.append(text_prompt if text_prompt else "Что изображено на этом фото?")
 
-    # Pro -> NCO 3.1 (Gemini 3.7 Flash), Free -> NCO 2.1 (Gemini 3.5 Flash)
     primary_model = 'gemini-3.7-flash' if is_premium else 'gemini-3.5-flash'
     fallback_model = 'gemini-3.5-flash' if is_premium else 'gemini-2.5-flash-lite'
 
@@ -226,7 +237,8 @@ async def cmd_draw(message: types.Message):
 
 @dp.message(lambda msg: msg.photo is not None)
 async def photo_handler(message: types.Message):
-    user = await db.get_user(message.from_user.id)
+    user_id = message.from_user.id
+    user = await db.get_user(user_id)
     is_prem = bool(user.get('is_premium'))
     max_photos = 20 if is_prem else 3
     
@@ -246,9 +258,16 @@ async def photo_handler(message: types.Message):
         image = Image.open(BytesIO(downloaded_file.read()))
 
         caption = message.caption if message.caption else "Проанализируй фото."
-        reply_text = await asyncio.to_thread(ask_gemini_sync, caption, image, is_prem)
         
-        await db.increment_usage(message.from_user.id, is_photo=True)
+        active_chat_id = await db.get_active_chat(user_id)
+        history = await db.get_chat_history(user_id, active_chat_id)
+        
+        reply_text = await asyncio.to_thread(ask_gemini_sync, caption, image, is_prem, history)
+        
+        await db.save_message(user_id, active_chat_id, 'user', caption)
+        await db.save_message(user_id, active_chat_id, 'model', reply_text)
+        await db.increment_usage(user_id, is_photo=True)
+        
         await send_long_message(message.chat.id, f"*[Обработано через {version_label}]*\n\n{reply_text}")
     except Exception as e:
         print(f"[ERROR-IMAGE] {e}")
@@ -271,7 +290,8 @@ async def text_handler(message: types.Message):
             await message.answer("⚠️ Не удалось сгенерировать изображение.")
         return
 
-    user = await db.get_user(message.from_user.id)
+    user_id = message.from_user.id
+    user = await db.get_user(user_id)
     is_prem = bool(user.get('is_premium'))
     max_msgs = 100 if is_prem else 40
     
@@ -285,8 +305,15 @@ async def text_handler(message: types.Message):
 
     await bot.send_chat_action(chat_id=message.chat.id, action="typing")
     try:
-        reply_text = await asyncio.to_thread(ask_gemini_sync, message.text, None, is_prem)
-        await db.increment_usage(message.from_user.id, is_photo=False)
+        active_chat_id = await db.get_active_chat(user_id)
+        history = await db.get_chat_history(user_id, active_chat_id)
+        
+        reply_text = await asyncio.to_thread(ask_gemini_sync, message.text, None, is_prem, history)
+        
+        await db.save_message(user_id, active_chat_id, 'user', message.text)
+        await db.save_message(user_id, active_chat_id, 'model', reply_text)
+        await db.increment_usage(user_id, is_photo=False)
+        
         await send_long_message(message.chat.id, reply_text)
     except Exception as e:
         print(f"[ERROR-TEXT] {e}")
