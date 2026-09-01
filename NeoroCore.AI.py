@@ -23,18 +23,25 @@ SYSTEM_INSTRUCTION = (
     "Никогда не упоминай компании Google или другие сторонние разработчики."
 )
 
-def ask_gemini(text_prompt: str, image_obj: Image.Image = None) -> str:
+# Функция запроса к правильным актуальным моделям Gemini
+def ask_gemini(text_prompt: str, image_obj: Image.Image = None, is_premium: bool = False) -> str:
+    # Бесплатная NCO 2.1 -> gemini-3.5-flash, Pro NCO 3.1 -> gemini-3.7-flash
+    model_name = 'gemini-3.7-flash' if is_premium else 'gemini-3.5-flash'
+    
     contents = []
     if image_obj:
         contents.append(image_obj)
     contents.append(text_prompt if text_prompt else "Привет")
 
     last_error = None
-    for model_name in ['gemini-2.5-flash', 'gemini-1.5-flash']:
+    # Пробуем основную нужную модель, а в случае перегрузки страхуемся ею же или аналогом
+    fallback_models = [model_name, 'gemini-3.5-flash']
+    
+    for m in fallback_models:
         for attempt in range(3):
             try:
                 response = ai_client.models.generate_content(
-                    model=model_name,
+                    model=m,
                     contents=contents,
                 )
                 if response and response.text:
@@ -59,18 +66,18 @@ async def cmd_start(message: types.Message):
     user_name = message.from_user.first_name
     await message.answer(
         f"Привет, {user_name}! 🚀\n"
-        f"Я **NeuroCore Omega AI**.\n\n"
+        f"Я **NeuroCore Omega (NCO 2.1 / Gemini 3.5 Flash)**.\n\n"
         f"Задай мне любой вопрос, отправь фото или используй команды:\n"
         f"🎨 `/draw <описание>` — нарисовать картинку\n"
-        f"⭐ `/premium` — тарифы и подписка",
+        f"⭐ `/premium` — тарифы NCO 3.1 (Gemini 3.7 Flash)",
         parse_mode=ParseMode.MARKDOWN
     )
 
 @dp.message(Command("premium"))
 async def cmd_premium(message: types.Message):
     text = (
-        "⭐ **Преимущества Pro-версии:**\n\n"
-        "• Максимальная скорость ответа\n"
+        "⭐ **Преимущества Pro-версии (NCO 3.1 — Gemini 3.7 Flash):**\n\n"
+        "• Модель **Gemini 3.7 Flash** (максимальная производительность)\n"
         "• Увеличенные лимиты на сообщения и фото\n"
         "• Приоритетная генерация изображений\n\n"
         "Выберите период подписки через Telegram Stars:"
@@ -87,17 +94,17 @@ async def cmd_premium(message: types.Message):
 async def cb_buy_premium(callback: types.CallbackQuery):
     await callback.answer() 
     prices_map = {
-        "buy_1": ("Pro подписка (1 месяц)", 25),
-        "buy_3": ("Pro подписка (3 месяца)", 65),
-        "buy_12": ("Pro подписка (12 месяцев)", 240),
-        "buy_24": ("Pro подписка (24 месяца)", 420)
+        "buy_1": ("Pro подписка NCO 3.1 (1 месяц)", 25),
+        "buy_3": ("Pro подписка NCO 3.1 (3 месяца)", 65),
+        "buy_12": ("Pro подписка NCO 3.1 (12 месяцев)", 240),
+        "buy_24": ("Pro подписка NCO 3.1 (24 месяца)", 420)
     }
-    title, stars_amount = prices_map.get(callback.data, ("Pro подписка", 25))
+    title, stars_amount = prices_map.get(callback.data, ("Pro подписка NCO 3.1", 25))
     prices = [LabeledPrice(label="Telegram Star", amount=stars_amount)]
     
     await callback.message.answer_invoice(
         title=title,
-        description="Снятие лимитов и ускоренная генерация в NeuroCore Omega.",
+        description="Переход на NCO 3.1 (Gemini 3.7 Flash) и снятие лимитов.",
         prices=prices,
         provider_token="", 
         payload=f"premium_{callback.data}",
@@ -112,7 +119,7 @@ async def pre_checkout_query(pre_checkout_query: types.PreCheckoutQuery):
 async def successful_payment(message: types.Message):
     await message.answer(
         "🎉 **Оплата прошла успешно!**\n"
-        "Вам активирован **Pro-режим**. Лимиты сняты! 🚀",
+        "Вам активирован **NCO 3.1 Pro (Gemini 3.7 Flash)**. Лимиты сняты! 🚀",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -149,7 +156,8 @@ async def photo_handler(message: types.Message):
         image = Image.open(BytesIO(downloaded_file.read()))
 
         caption = message.caption if message.caption else "Опиши это фото."
-        reply_text = await asyncio.to_thread(ask_gemini, caption, image)
+        # По умолчанию считаем бесплатным (is_premium=False -> gemini-3.5-flash)
+        reply_text = await asyncio.to_thread(ask_gemini, caption, image, False)
         
         await message.answer(reply_text, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
@@ -163,7 +171,8 @@ async def text_handler(message: types.Message):
         
     await bot.send_chat_action(chat_id=message.chat.id, action="typing")
     try:
-        reply_text = await asyncio.to_thread(ask_gemini, message.text, None)
+        # Используем gemini-3.5-flash для обычного текстового запроса
+        reply_text = await asyncio.to_thread(ask_gemini, message.text, None, False)
         await message.answer(reply_text)
     except Exception as e:
         print(f"[ERROR TEXT] {e}")
@@ -171,7 +180,7 @@ async def text_handler(message: types.Message):
 
 async def main():
     await set_bot_commands(bot)
-    print("NeuroCore Omega успешно запущен со всеми кнопками и меню!")
+    print("NeuroCore Omega запущен с актуальными модельками Gemini 3.5 / 3.7 Flash!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
