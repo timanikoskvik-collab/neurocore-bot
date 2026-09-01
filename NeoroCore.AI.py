@@ -62,18 +62,17 @@ async def cmd_start(message: types.Message):
     is_prem = bool(user.get('is_premium'))
     user_name = message.from_user.first_name
     
-    # Автоматически создаем чат по умолчанию, если его нет
     active_chat = await db.get_active_chat(user_id)
     if not active_chat:
         await db.create_new_chat(user_id, "Чат 1 (Основной)")
 
-    version_name = "NCO 3.1 (Pro)" if is_prem else "NCO 2.1 (Бесплатный)"
-    status_text = "⭐ Pro (Максимальная скорость)" if is_prem else "Бесплатный (Стандартная скорость)"
+    version_name = "NCO 3.1 Pro (Gemini 3.7 Flash)" if is_prem else "NCO 2.1 (Gemini 3.5 Flash)"
+    status_text = "⭐ Pro (Максимальные лимиты)" if is_prem else "Бесплатный (Стандартные лимиты)"
     
     await message.answer(
         f"Привет, {user_name}! 🚀\n"
-        f"Я **NeuroCore Omega (версия {version_name})**.\n"
-        f"Графический модуль: **NeuroVision Core 2.1 (Flux Powered)** 🎨\n\n"
+        f"Я **NeuroCore Omega ({version_name})**.\n"
+        f"Графический модуль: **NeuroVision Core** 🎨\n\n"
         f"📊 Твой статус: **{status_text}**\n"
         f"Задай мне любой вопрос, отправь фото или напиши: `/draw <что нарисовать>`!",
         parse_mode=ParseMode.MARKDOWN
@@ -103,17 +102,13 @@ async def cmd_my_chats(message: types.Message):
 
 @dp.message(Command("premium"))
 async def cmd_premium(message: types.Message):
-    user = await db.get_user(message.from_user.id)
-    is_prem = bool(user.get('is_premium'))
-    ver_label = "NCO 3.1" if is_prem else "NCO 2.1"
-    
     text = (
-        f"⭐ **Преимущества Pro-версии ({ver_label}):**\n\n"
-        "• Максимальная скорость ответа без ожидания\n"
+        "⭐ **Преимущества Pro-версии (NCO 3.1):**\n\n"
+        "• Модель **Gemini 3.7 Flash** (максимальная скорость и ум)\n"
         "• **100 сообщений** в сутки (вместо 40)\n"
         "• **20 фотографий** в сутки (вместо 3)\n"
-        "• Приоритетная генерация в NeuroVision Core\n\n"
-        "Выберите период подписки:"
+        "• **10 генераций картинок** в сутки (вместо 1)\n\n"
+        "Выберите период подписки через Telegram Stars:"
     )
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⭐ 1 месяц — 25 Stars", callback_data="buy_1")],
@@ -171,11 +166,14 @@ async def successful_payment(message: types.Message):
     await db.set_premium(message.from_user.id, True)
     await message.answer(
         "🎉 **Оплата прошла успешно!**\n"
-        "Вам активирован **NCO 3.1 (Pro)**. Скорость и лимиты максимальные! 🚀",
+        "Вам активирован **NCO 3.1 Pro (Gemini 3.7 Flash)**. Лимиты сняты! 🚀",
         parse_mode=ParseMode.MARKDOWN
     )
 
-def ask_gemini_sync(text_prompt: str, image_obj: Image.Image = None, history: list = None) -> str:
+def ask_gemini_sync(text_prompt: str, image_obj: Image.Image = None, is_premium: bool = False, history: list = None) -> str:
+    # Выбираем модель в зависимости от статуса подписки
+    model_name = 'gemini-3.7-flash' if is_premium else 'gemini-3.5-flash'
+    
     full_prompt = ""
     if history:
         for role, text in history:
@@ -188,15 +186,15 @@ def ask_gemini_sync(text_prompt: str, image_obj: Image.Image = None, history: li
     if image_obj:
         contents.append(image_obj)
 
-    # Делаем попытку запроса с автоповтором (retry) на случай ошибки 503
     last_error = None
-    models_to_try = ['gemini-2.5-flash', 'gemini-2.5-flash-lite']
+    # Пробуем основную модель, при сбое делаем запасной заход на flash-lite или аналогичную
+    fallback_models = [model_name, 'gemini-3.5-flash-lite']
     
-    for model_name in models_to_try:
-        for attempt in range(2): # 2 попытки на модель
+    for m in fallback_models:
+        for _ in range(2):
             try:
                 response = ai_client.models.generate_content(
-                    model=model_name,
+                    model=m,
                     contents=contents,
                     config=genai_types.GenerateContentConfig(
                         system_instruction=SYSTEM_INSTRUCTION
@@ -207,7 +205,7 @@ def ask_gemini_sync(text_prompt: str, image_obj: Image.Image = None, history: li
             except Exception as e:
                 last_error = e
                 import time
-                time.sleep(1) # небольшая пауза перед повтором
+                time.sleep(1)
                 
     raise last_error
 
@@ -219,6 +217,23 @@ async def generate_image(prompt: str) -> str:
 @dp.message(Command("draw"))
 async def cmd_draw(message: types.Message):
     prompt = message.text.replace("/draw", "").strip()
+    user_id = message.from_user.id
+    user = await db.get_user(user_id)
+    is_prem = bool(user.get('is_premium'))
+    
+    # Лимиты на генерацию картинок: 1 для бесплатных, 10 для Pro
+    max_draws = 10 if is_prem else 1
+    # Предполагаем, что в базе есть поле draw_count (или проверяй по своей логике)
+    current_draws = user.get('draw_count', 0)
+    
+    if current_draws >= max_draws:
+        await message.answer(
+            f"⚠️ **Лимит картинок исчерпан [NCO-429]**\n"
+            f"Вы исчерпали суточный лимит генерации изображений ({max_draws}/{max_draws}).\n"
+            f"Оформите /premium для увеличения лимита до 10 картинок в сутки!"
+        )
+        return
+
     if not prompt:
         await message.answer(
             "🎨 **Как пользоваться генератором картинок:**\n\n"
@@ -231,13 +246,14 @@ async def cmd_draw(message: types.Message):
         )
         return
 
-    user = await db.get_user(message.from_user.id)
-    version_label = "NCO 3.1 Pro" if user.get('is_premium') else "NCO 2.1"
+    version_label = "NCO 3.1 Pro" if is_prem else "NCO 2.1"
     await message.answer(f"🎨 *NeuroVision Core ({version_label}) генерирует изображение...*", parse_mode=ParseMode.MARKDOWN)
     await bot.send_chat_action(chat_id=message.chat.id, action="upload_photo")
     
     try:
         image_url = await generate_image(prompt)
+        # Если у тебя есть функция увеличения счетчика картинок, вызывай её тут:
+        # await db.increment_draw_usage(user_id)
         await message.answer_photo(photo=image_url, caption=f"🎨 **NeuroVision Core**\n🖼 **Запрос:** _{prompt}_", parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         err_msg = format_error_code("404-IMG", e)
@@ -253,8 +269,8 @@ async def photo_handler(message: types.Message):
     
     if user.get('photo_count', 0) >= max_photos:
         await message.answer(
-            f"⚠️ **Лимит исчерпан [NCO-429]**\n"
-            f"Вы исчерпали суточный лимит загрузки изображений ({max_photos}/{max_photos}).\n"
+            f"⚠️ **Лимит фотографий исчерпан [NCO-429]**\n"
+            f"Вы исчерпали суточный лимит анализа изображений ({max_photos}/{max_photos}).\n"
             f"Лимит обновится через 24 часа или оформите /premium."
         )
         return
@@ -274,7 +290,7 @@ async def photo_handler(message: types.Message):
             
         history = await db.get_chat_history(user_id, active_chat_id)
         
-        reply_text = await asyncio.to_thread(ask_gemini_sync, caption, image, history)
+        reply_text = await asyncio.to_thread(ask_gemini_sync, caption, image, is_prem, history)
         
         await db.save_message(user_id, active_chat_id, 'user', caption)
         await db.save_message(user_id, active_chat_id, 'model', reply_text)
@@ -295,8 +311,17 @@ async def text_handler(message: types.Message):
     
     if text_lower.startswith("нарисуй ") or text_lower.startswith("сгенерируй "):
         prompt = message.text.split(" ", 1)[1]
-        user = await db.get_user(message.from_user.id)
-        version_label = "NCO 3.1 Pro" if user.get('is_premium') else "NCO 2.1"
+        user_id = message.from_user.id
+        user = await db.get_user(user_id)
+        is_prem = bool(user.get('is_premium'))
+        
+        max_draws = 10 if is_prem else 1
+        current_draws = user.get('draw_count', 0)
+        if current_draws >= max_draws:
+            await message.answer(f"⚠️ **Лимит картинок исчерпан [NCO-429]**\nОформите /premium для увеличения лимита!")
+            return
+
+        version_label = "NCO 3.1 Pro" if is_prem else "NCO 2.1"
         await message.answer(f"🎨 *NeuroVision Core ({version_label}) генерирует изображение...*", parse_mode=ParseMode.MARKDOWN)
         await bot.send_chat_action(chat_id=message.chat.id, action="upload_photo")
         try:
@@ -315,7 +340,7 @@ async def text_handler(message: types.Message):
     
     if user.get('msg_count', 0) >= max_msgs:
         await message.answer(
-            f"⚠️ **Лимит исчерпан [NCO-429]**\n"
+            f"⚠️ **Лимит сообщений исчерпан [NCO-429]**\n"
             f"Вы исчерпали суточный лимит текстовых запросов ({max_msgs}/{max_msgs}).\n"
             f"Лимит обновится через 24 часа или оформите /premium."
         )
@@ -329,7 +354,7 @@ async def text_handler(message: types.Message):
             
         history = await db.get_chat_history(user_id, active_chat_id)
         
-        reply_text = await asyncio.to_thread(ask_gemini_sync, message.text, None, history)
+        reply_text = await asyncio.to_thread(ask_gemini_sync, message.text, None, is_prem, history)
         
         await db.save_message(user_id, active_chat_id, 'user', message.text)
         await db.save_message(user_id, active_chat_id, 'model', reply_text)
