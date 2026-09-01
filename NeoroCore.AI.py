@@ -2,7 +2,6 @@ import os
 import random
 import asyncio
 import urllib.parse
-import traceback
 from io import BytesIO
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.enums import ParseMode
@@ -29,7 +28,6 @@ SYSTEM_INSTRUCTION = (
 )
 
 def format_error_code(err_type: str, exception: Exception) -> str:
-    """Генерирует зашифрованный код ошибки для отладки"""
     err_hash = abs(hash(str(exception))) % 10000
     return f"⚠️ [NCO-{err_type} | REF: {err_hash:04d}] Системный узел временно недоступен. Повторите запрос."
 
@@ -168,16 +166,27 @@ async def successful_payment(message: types.Message):
 
 def ask_gemini_sync(text_prompt: str, image_obj: Image.Image = None, is_premium: bool = False, history: list = None) -> str:
     contents = []
+    
     if history:
         for role, text in history:
-            contents.append(text)
+            api_role = "user" if role == "user" else "model"
+            contents.append({
+                "role": api_role,
+                "parts": [{"text": text}]
+            })
     
+    current_parts = []
     if image_obj:
-        contents.append(image_obj)
-    contents.append(text_prompt if text_prompt else "Что изображено на этом фото?")
+        current_parts.append(image_obj)
+    current_parts.append(text_prompt if text_prompt else "Что изображено на этом фото?")
+    
+    contents.append({
+        "role": "user",
+        "parts": current_parts
+    })
 
-    primary_model = 'gemini-3.7-flash' if is_premium else 'gemini-3.5-flash'
-    fallback_model = 'gemini-3.5-flash' if is_premium else 'gemini-2.5-flash-lite'
+    primary_model = 'gemini-2.5-flash'
+    fallback_model = 'gemini-2.5-flash-lite'
 
     try:
         response = ai_client.models.generate_content(
@@ -189,7 +198,7 @@ def ask_gemini_sync(text_prompt: str, image_obj: Image.Image = None, is_premium:
         )
         return response.text
     except Exception as e:
-        print(f"[WARN 503] {primary_model} error: {e}")
+        print(f"[WARN 503] Primary model error: {e}")
 
     try:
         response = ai_client.models.generate_content(
@@ -205,12 +214,7 @@ def ask_gemini_sync(text_prompt: str, image_obj: Image.Image = None, is_premium:
         raise final_error
 
 async def generate_image(prompt: str) -> str:
-    clean_prompt = prompt.lower().strip()
-    if "железного человека" in clean_prompt or "железный человек" in clean_prompt:
-        translated_prompt = "Iron Man superhero in mechanical suit, cinematic lighting"
-    else:
-        translated_prompt = f"{prompt}, highly detailed, cinematic lighting, 8k resolution"
-
+    translated_prompt = f"{prompt}, highly detailed, cinematic lighting, 8k resolution"
     encoded_prompt = urllib.parse.quote(translated_prompt)
     seed = random.randint(1, 999999)
     return f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&model=flux&nologo=true&seed={seed}"
