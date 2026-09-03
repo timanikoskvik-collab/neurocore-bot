@@ -22,19 +22,17 @@ dp = Dispatcher()
 
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# Обновленный системный промпт с четким контекстом Telegram
 SYSTEM_INSTRUCTION = (
     "Ты — высокоинтеллектуальный, эрудированный и живой собеседник NeuroCore Omega. "
     "Ты работаешь ИСКЛЮЧИТЕЛЬНО внутри мессенджера Telegram в формате бота. "
-    "У тебя НЕТ бокового меню, боковых панелей, вкладок 'прошлые чаты' или веб-интерфейса. "
-    "Вся история общения находится прямо здесь, в этой ленте сообщений Telegram. "
-    "Если пользователь спрашивает про прошлые диалоги, объясняй, что они находятся выше в истории чата Telegram, "
-    "а начать тему заново можно командой /clear. "
+    "У тебя НЕТ бокового меню, боковых панелей или вкладок веб-интерфейса. "
+    "Вся история общения находится прямо здесь, в ленте сообщений Telegram. "
+    "Искусственный интеллект обладает отличной памятью, но по команде очистки диалога "
+    "прошлый контекст полностью сбрасывается, и общение начинается с чистого листа. "
     "Отвечай глубоко и естественно. Никогда не используй фразы 'я искусственный интеллект', "
     "'мои сервера работают', 'загляните в меню слева'. Никогда не упоминай Google."
 )
 
-# Заглушка для веб-сервера Render
 async def handle_ping(request):
     return web.Response(text="NeuroCore Omega is active!")
 
@@ -53,7 +51,7 @@ async def set_bot_commands(bot: Bot):
         BotCommand(command="chats", description="💬 Сменить ветку чата"),
         BotCommand(command="draw", description="🎨 Сгенерировать картинку"),
         BotCommand(command="premium", description="⭐ Оформить Pro подписку"),
-        BotCommand(command="clear", description="🧹 Очистить память диалога"),
+        BotCommand(command="clear", description="🧹 Очистить память и начать новый чат"),
     ]
     await bot.set_my_commands(commands)
 
@@ -118,12 +116,12 @@ async def cmd_start(message: types.Message):
         f"Приветствую, {user_name}! 🚀\n"
         f"Я **NeuroCore Omega ({version_name})**.\n\n"
         f"📊 Ваш статус: **{status_text}**\n"
-        f"💬 Текущая ветка: **Чат {active_session}**\n"
+        f"💬 Текущий чат: **№{active_session}**\n"
         f"✉️ Сообщений доступно: **{user['msg_left']}**\n"
         f"📸 Фотографий доступно: **{user['photo_left']}**\n"
         f"🎨 Генераций картинок: **{user['draw_left']}**\n\n"
         f"Задайте любой вопрос, отправьте фото или напишите `/draw <запрос>`.\n"
-        f"Для переключения между темами используйте `/chats`.",
+        f"Для управления темами используйте `/chats`.",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -134,19 +132,16 @@ async def cmd_chats(message: types.Message):
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text=f"{'🟢 ' if current_session == 1 else ''}💬 Чат 1 (Главный)", callback_data="set_chat_1"),
-            InlineKeyboardButton(text=f"{'🟢 ' if current_session == 2 else ''}💬 Чат 2 (Рабочий)", callback_data="set_chat_2"),
-        ],
-        [
-            InlineKeyboardButton(text=f"{'🟢 ' if current_session == 3 else ''}💬 Чат 3 (Идеи/Творчество)", callback_data="set_chat_3"),
+            InlineKeyboardButton(text=f"💬 Чат 1", callback_data="set_chat_1"),
+            InlineKeyboardButton(text=f"💬 Чат 2", callback_data="set_chat_2"),
+            InlineKeyboardButton(text=f"💬 Чат 3", callback_data="set_chat_3"),
         ]
     ])
     
     await message.answer(
         f"💬 **Управление ветками диалога**\n\n"
-        f"Текущий активный чат: **Чат {current_session}**\n\n"
-        f"Вы можете переключаться между 3 разными темами. "
-        f"История каждой темы сохраняется отдельно!",
+        f"Текущий активный чат: **№{current_session}**\n\n"
+        f"Вы можете переключаться между ветками или создать новую с помощью команды `/clear`.",
         reply_markup=keyboard,
         parse_mode=ParseMode.MARKDOWN
     )
@@ -159,35 +154,23 @@ async def cb_set_chat(callback: types.CallbackQuery):
     await db.set_active_session(user_id, session_id)
     await callback.answer(f"Переключено на Чат {session_id}!")
     
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text=f"{'🟢 ' if session_id == 1 else ''}💬 Чат 1", callback_data="set_chat_1"),
-            InlineKeyboardButton(text=f"{'🟢 ' if session_id == 2 else ''}💬 Чат 2", callback_data="set_chat_2"),
-        ],
-        [
-            InlineKeyboardButton(text=f"{'🟢 ' if session_id == 3 else ''}💬 Чат 3", callback_data="set_chat_3"),
-        ]
-    ])
-    
     await callback.message.edit_text(
-        f"✅ **Вы переключились на Чат {session_id}!**\n\n"
-        f"Теперь все отправленные сообщения сохраняются в этой ветке. "
-        f"Чтобы сбросить только эту тему, используйте `/clear`.",
-        reply_markup=keyboard,
+        f"✅ **Вы переключились на Чат №{session_id}!**\n\n"
+        f"Все последующие сообщения будут идти в рамках этой ветки.",
         parse_mode=ParseMode.MARKDOWN
     )
 
 @dp.message(Command("clear"))
 async def cmd_clear(message: types.Message):
     user_id = message.from_user.id
-    user = await db.get_user(user_id)
-    active_session = user.get('active_session', 1)
+    # Создаем абсолютно новый чистый слот чата
+    new_session = await db.create_new_session(user_id)
     
-    await db.clear_history(user_id, session_id=active_session)
     await message.answer(
-        f"🧹 **Память Чата {active_session} очищена!**\n\n"
-        "Я больше не учитываю прошлые сообщения при ответе в этой ветке. "
-        "Сами сообщения выше остаются в вашей ленте Telegram, но для меня наш диалог начат с чистого листа.",
+        f"🧹 **Память диалога полностью очищена!**\n\n"
+        f"✅ Создан и активирован **новый чистый чат (№{new_session})**.\n\n"
+        f"🧠 **Как это работает:**\n"
+        f"Искусственный интеллект обладает отличной памятью, но теперь старый контекст больше не учитывается — диалог начат с чистого листа. Прошлые темы сохранены в истории, и вы в любой момент можете вернуться к ним через меню `/chats`.",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -331,7 +314,7 @@ async def text_handler(message: types.Message):
 async def main():
     await db.init_db()
     await set_bot_commands(bot)
-    await start_web_server()  # Запуск встроенного веб-сервера для удовлетворения проверок Render
+    await start_web_server()
     print("NeuroCore Omega запущен!")
     await dp.start_polling(bot)
 
