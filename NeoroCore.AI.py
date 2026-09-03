@@ -202,7 +202,10 @@ async def cmd_premium(message: types.Message):
     )
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⭐ 1 месяц — 25 Stars", callback_data="buy_1")],
-        [InlineKeyboardButton(text="⭐ 12 месяцев — 240 Stars", callback_data="buy_12")],
+        [InlineKeyboardButton(text="⭐ 3 месяца — 70 Stars (выгода 7%)", callback_data="buy_3")],
+        [InlineKeyboardButton(text="⭐ 6 месяцев — 130 Stars (выгода 13%)", callback_data="buy_6")],
+        [InlineKeyboardButton(text="⭐ 12 месяцев — 240 Stars (выгода 20%)", callback_data="buy_12")],
+        [InlineKeyboardButton(text="⭐ 24 месяца — 420 Stars (выгода 30%)", callback_data="buy_24")],
     ])
     await message.answer(text, reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
 
@@ -212,7 +215,10 @@ async def cb_buy_premium(callback: types.CallbackQuery):
     data_key = callback.data
     prices_map = {
         "buy_1": ("Pro подписка NCO 3.1 (1 месяц)", 25),
+        "buy_3": ("Pro подписка NCO 3.1 (3 месяца)", 70),
+        "buy_6": ("Pro подписка NCO 3.1 (6 месяцев)", 130),
         "buy_12": ("Pro подписка NCO 3.1 (12 месяцев)", 240),
+        "buy_24": ("Pro подписка NCO 3.1 (24 месяца)", 420),
     }
     
     title, stars_amount = prices_map.get(data_key, ("Pro подписка NCO 3.1", 25))
