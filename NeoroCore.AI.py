@@ -194,7 +194,7 @@ async def cmd_clear(message: types.Message):
 async def cmd_premium(message: types.Message):
     text = (
         "⭐ **Преимущества NCO 3.1 Pro:**\n\n"
-        "• Модель **Gemini 3.7 Flash**\n"
+        "• Модель **Gemini 3.7 Flash** (мгновенный ответ)\n"
         "• **100 сообщений** в сутки\n"
         "• **20 фотографий** в сутки\n"
         "• **10 генераций картинок** в сутки\n\n"
@@ -256,17 +256,26 @@ async def cmd_draw(message: types.Message):
         await message.answer("🎨 Укажите описание. Пример: `/draw футуристичный город`", parse_mode=ParseMode.MARKDOWN)
         return
 
-    version_label = "NCO 3.1 Pro" if user.get('is_premium') else "NCO 2.1"
-    await message.answer(f"🎨 *NeuroVision ({version_label}) создает изображение...*", parse_mode=ParseMode.MARKDOWN)
+    is_prem = bool(user.get('is_premium'))
+    version_label = "NCO 3.1 Pro" if is_prem else "NCO 2.1"
+    
+    # Бесплатная версия думает дольше
+    if not is_prem:
+        await message.answer(f"⏳ *NeuroVision ({version_label}) обдумывает концепт (бесплатный режим)...*", parse_mode=ParseMode.MARKDOWN)
+        await asyncio.sleep(3)
+    else:
+        await message.answer(f"🎨 *NeuroVision ({version_label}) создает изображение...*", parse_mode=ParseMode.MARKDOWN)
+        
     await bot.send_chat_action(chat_id=message.chat.id, action="upload_photo")
     
     try:
-        is_prem = bool(user.get('is_premium'))
-        translated_prompt = await ask_gemini(f"Translate this text prompt to English for image generator. Return ONLY translation: {prompt}", None, is_prem)
+        raw_translation = await ask_gemini(f"Translate this text prompt to English for an AI image generator. Return ONLY the translated text, without any quotes, explanations, or code blocks: {prompt}", None, is_prem)
         
-        encoded_prompt = urllib.parse.quote(translated_prompt.strip())
+        clean_prompt = raw_translation.replace("```", "").replace("text", "").strip()
+        
+        encoded_prompt = urllib.parse.quote(clean_prompt)
         seed = random.randint(1, 999999)
-        image_url = f"https://pollinations.ai/p/{encoded_prompt}?width=1024&height=1024&seed={seed}&model=flux"
+        image_url = f"[https://image.pollinations.ai/prompt/](https://image.pollinations.ai/prompt/){encoded_prompt}?width=1024&height=1024&seed={seed}&model=flux&nologo=true"
         
         await message.answer_photo(photo=image_url, caption=f"🎨 **NeuroVision Core**\n🖼 **Запрос:** _{prompt}_", parse_mode=ParseMode.MARKDOWN)
         await db.decrement_limit(user_id, 'draw')
@@ -284,6 +293,10 @@ async def photo_handler(message: types.Message):
         await message.answer("⚠️ **Лимит фотографий исчерпан.**")
         return
 
+    is_prem = bool(user.get('is_premium'))
+    if not is_prem:
+        await asyncio.sleep(2.5)  # Бесплатная версия думает дольше перед ответом
+
     await bot.send_chat_action(chat_id=message.chat.id, action="typing")
     try:
         photo_file = await bot.get_file(message.photo[-1].file_id)
@@ -294,7 +307,6 @@ async def photo_handler(message: types.Message):
         
         active_session = user.get('active_session', 1)
         history = await db.get_history(user_id, session_id=active_session)
-        is_prem = bool(user.get('is_premium'))
         
         reply_text = await ask_gemini(caption, image, is_prem, history)
         
@@ -316,11 +328,14 @@ async def text_handler(message: types.Message):
         await message.answer("⚠️ **Лимит сообщений исчерпан.**")
         return
 
+    is_prem = bool(user.get('is_premium'))
+    if not is_prem:
+        await asyncio.sleep(2)  # Бесплатный режим размышляет дольше
+
     await bot.send_chat_action(chat_id=message.chat.id, action="typing")
     try:
         active_session = user.get('active_session', 1)
         history = await db.get_history(user_id, session_id=active_session)
-        is_prem = bool(user.get('is_premium'))
         
         reply_text = await ask_gemini(message.text, None, is_prem, history)
         
