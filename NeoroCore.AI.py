@@ -9,17 +9,16 @@ from aiogram.filters import Command
 from aiogram.types import Message, BufferedInputFile
 from google import genai
 
-# Инициализация переменных окружения
-TOKEN = os.getenv("BOT_TOKEN")
+# Инициализация переменных окружения с учетом TELEGRAM_TOKEN
+TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 if not TOKEN:
-    raise ValueError("Не найден BOT_TOKEN!")
+    raise ValueError("Не найден TELEGRAM_TOKEN!")
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# Инициализация клиента Gemini (если ключ есть)
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 
@@ -29,14 +28,12 @@ gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 def init_db():
     conn = sqlite3.connect("nco_database.db")
     cursor = conn.cursor()
-    # Таблица пользователей (уровень подписки: 'free' или 'pro')
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             tier TEXT DEFAULT 'free'
         )
     """)
-    # Таблица истории сообщений для сохранения контекста чата
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS chat_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -149,23 +146,21 @@ async def cmd_start(message: Message):
 
 @dp.message(Command("pro"))
 async def cmd_pro(message: Message):
-    # Упрощенная выдача Pro-статуса для теста
     conn = sqlite3.connect("nco_database.db")
     cursor = conn.cursor()
     cursor.execute("UPDATE users SET tier = 'pro' WHERE user_id = ?", (message.from_user.id,))
     conn.commit()
     conn.close()
-    await message.answer("✨ Режим **PRO** успешно активирован! Доступны приоритетные модели и отсутствие задержек.", parse_mode="Markdown")
+    await message.answer("✨ Режим **PRO** успешно активирован!", parse_mode="Markdown")
 
 @dp.message(Command("draw"))
 async def cmd_draw(message: Message):
     user_id = message.from_user.id
     tier = get_user_tier(user_id)
     
-    # Скоростное ограничение (throttling) для Free пользователей
     if tier == 'free':
-        status_msg = await message.answer("⏳ Free-режим: ожидание очереди (speed-throttling)...")
-        await asyncio.sleep(4) # Искусственная пауза для бесплатного тарифа
+        status_msg = await message.answer("⏳ Free-режим: ожидание очереди...")
+        await asyncio.sleep(4)
     else:
         status_msg = await message.answer("⚡ Pro-режим: мгновенная генерация концепта...")
 
@@ -186,7 +181,7 @@ async def cmd_draw(message: Message):
             pass
     else:
         try:
-            await status_msg.edit_text("⚠️ Не удалось сгенерировать изображение. Лимит не списан.")
+            await status_msg.edit_text("⚠️ Не удалось сгенерировать изображение.")
         except:
             await message.answer("⚠️ Не удалось сгенерировать изображение.")
 
@@ -196,27 +191,22 @@ async def handle_chat(message: Message):
     tier = get_user_tier(user_id)
     user_text = message.text
 
-    # Сохраняем сообщение пользователя в историю
     save_message_to_db(user_id, "user", user_text)
-
-    # Эмуляция ответа с учетом тарифа и истории
     history = get_chat_history(user_id, limit=6)
     
     if tier == 'free':
-        await asyncio.sleep(2) # Эмуляция задержки для free
-        model_name = "Gemini 3.5 Flash (Free)"
+        await asyncio.sleep(2)
+        model_name = "Gemini Flash (Free)"
     else:
-        model_name = "Gemini 3.7 Flash (Pro - High-Speed)"
+        model_name = "Gemini Flash (Pro)"
 
-    # Ответ через Gemini API (если настроен ключ), иначе заглушка
-    response_text = f"🧠 **NCO Terminal [{model_name}]**:\nЗапрос обработан с учетом истории чата.\nВаш текст: {user_text}"
+    response_text = f"🧠 **NCO Terminal [{model_name}]**:\nЗапрос обработан.\nВаш текст: {user_text}"
     
     if gemini_client:
         try:
-            # Формируем контекст из истории
             contents = "\n".join([f"{h[0]}: {h[1]}" for h in history])
             response = gemini_client.models.generate_content(
-                model='gemini-2.5-flash', # или актуальная доступная модель
+                model='gemini-2.5-flash',
                 contents=contents,
             )
             if response and response.text:
@@ -224,9 +214,7 @@ async def handle_chat(message: Message):
         except Exception as e:
             print(f"Gemini API error: {e}")
 
-    # Сохраняем ответ бота в историю
     save_message_to_db(user_id, "model", response_text)
-    
     await message.answer(response_text, parse_mode="Markdown")
 
 
