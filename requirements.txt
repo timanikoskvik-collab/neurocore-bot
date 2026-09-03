@@ -1,4 +1,4 @@
-aiogram==3.15.0
-aiosqlite==0.20.0
-google-genai==0.1.1
-Pillow==11.0.0
+aiogram
+aiosqlite
+google-genai
+Pillow
