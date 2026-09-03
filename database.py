@@ -39,12 +39,17 @@ async def check_and_update_limits(user_id: int):
         async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as cursor:
             user = await cursor.fetchone()
             if not user:
-                await db.execute(
-                    "INSERT INTO users (user_id, msg_left, photo_left, draw_left, active_session, last_full_reset, last_hourly_bonus) VALUES (?, ?, ?, ?, 1, ?, ?)",
-                    (user_id, FREE_LIMITS["msg"], FREE_LIMITS["photo"], FREE_LIMITS["draw"], current_time, current_time)
-                )
-                await db.commit()
-                return await get_user(user_id)
+                try:
+                    await db.execute(
+                        "INSERT INTO users (user_id, msg_left, photo_left, draw_left, active_session, last_full_reset, last_hourly_bonus) VALUES (?, ?, ?, ?, 1, ?, ?)",
+                        (user_id, FREE_LIMITS["msg"], FREE_LIMITS["photo"], FREE_LIMITS["draw"], current_time, current_time)
+                    )
+                    await db.commit()
+                except Exception:
+                    pass
+                async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as cur:
+                    user = await cur.fetchone()
+                return dict(user) if user else {"user_id": user_id, "is_premium": 0, "msg_left": 40, "active_session": 1}
 
             if current_time - user['last_full_reset'] >= 86400:
                 is_prem = bool(user['is_premium'])
@@ -55,7 +60,9 @@ async def check_and_update_limits(user_id: int):
                     (limits["msg"], limits["photo"], limits["draw"], current_time, current_time, user_id)
                 )
                 await db.commit()
-                return await get_user(user_id)
+                async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as cur:
+                    user = await cur.fetchone()
+                return dict(user)
             
             if current_time - user['last_hourly_bonus'] >= 3600:
                 is_prem = bool(user['is_premium'])
@@ -68,17 +75,12 @@ async def check_and_update_limits(user_id: int):
                     (new_msg, new_photo, new_draw, current_time, user_id)
                 )
                 await db.commit()
-
-async def get_user(user_id: int):
-    await check_and_update_limits(user_id)
-    async with aiosqlite.connect(DB_NAME) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as cursor:
-            user = await cursor.fetchone()
             return dict(user)
 
+async def get_user(user_id: int):
+    return await check_and_update_limits(user_id)
+
 async def set_active_session(user_id: int, session_id: int):
-    """Смена текущей ветки чата"""
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("UPDATE users SET active_session = ? WHERE user_id = ?", (session_id, user_id))
         await db.commit()
@@ -104,7 +106,6 @@ async def add_message(user_id: int, role: str, content: str, session_id: int = 1
         await db.commit()
 
 async def get_history(user_id: int, session_id: int = 1, limit: int = 10):
-    """Возвращает историю конкретного чата"""
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute(
             "SELECT role, content FROM (SELECT * FROM history WHERE user_id = ? AND session_id = ? ORDER BY timestamp DESC LIMIT ?) ORDER BY timestamp ASC",
@@ -114,7 +115,21 @@ async def get_history(user_id: int, session_id: int = 1, limit: int = 10):
             return [{"role": role, "parts": [{"text": content}]} for role, content in rows]
 
 async def clear_history(user_id: int, session_id: int = 1):
-    """Очищает историю только текущего чата"""
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("DELETE FROM history WHERE user_id = ? AND session_id = ?", (user_id, session_id))
         await db.commit()
+
+async def create_new_session(user_id: int) -> int:
+    """Создает новый уникальный слот чата для пользователя и переключает на него"""
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT MAX(session_id) FROM history WHERE user_id = ?", (user_id,)) as cursor:
+            row = await cursor.fetchone()
+            max_hist = row[0] if row and row[0] else 0
+        async with db.execute("SELECT active_session FROM users WHERE user_id = ?", (user_id,)) as cursor:
+            row = await cursor.fetchone()
+            max_user = row[0] if row and row[0] else 1
+        
+        new_session = max(max_hist, max_user) + 1
+        await db.execute("UPDATE users SET active_session = ? WHERE user_id = ?", (new_session, user_id))
+        await db.commit()
+        return new_session
