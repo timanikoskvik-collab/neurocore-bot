@@ -55,6 +55,23 @@ async def set_bot_commands(bot: Bot):
     ]
     await bot.set_my_commands(commands)
 
+async def send_long_message(message: types.Message, text: str):
+    """Безопасная отправка длинных сообщений кусками по 4000 символов"""
+    if not text:
+        return
+    if len(text) <= 4000:
+        try:
+            await message.answer(text, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            await message.answer(text)
+    else:
+        for x in range(0, len(text), 4000):
+            chunk = text[x:x+4000]
+            try:
+                await message.answer(chunk, parse_mode=ParseMode.MARKDOWN)
+            except Exception:
+                await message.answer(chunk)
+
 async def ask_gemini(text_prompt: str, image_obj: Image.Image = None, is_premium: bool = False, history: list = None) -> str:
     model_name = 'gemini-3.7-flash' if is_premium else 'gemini-3.5-flash'
     
@@ -163,7 +180,6 @@ async def cb_set_chat(callback: types.CallbackQuery):
 @dp.message(Command("clear"))
 async def cmd_clear(message: types.Message):
     user_id = message.from_user.id
-    # Создаем абсолютно новый чистый слот чата
     new_session = await db.create_new_session(user_id)
     
     await message.answer(
@@ -276,7 +292,7 @@ async def photo_handler(message: types.Message):
         
         reply_text = await ask_gemini(caption, image, is_prem, history)
         
-        await message.answer(reply_text)
+        await send_long_message(message, reply_text)
         await db.add_message(user_id, 'user', caption, session_id=active_session)
         await db.add_message(user_id, 'model', reply_text, session_id=active_session)
         await db.decrement_limit(user_id, 'photo')
@@ -302,14 +318,14 @@ async def text_handler(message: types.Message):
         
         reply_text = await ask_gemini(message.text, None, is_prem, history)
         
-        await message.answer(reply_text)
+        await send_long_message(message, reply_text)
         await db.add_message(user_id, 'user', message.text, session_id=active_session)
         await db.add_message(user_id, 'model', reply_text, session_id=active_session)
         await db.decrement_limit(user_id, 'msg')
         
     except Exception as e:
         print(f"[ERROR-TEXT] {e}")
-        await message.answer("⚠️ Сбой генерации.")
+        await message.answer("⚠️ Сбой генерации. Возможно, модель временно перегружена (ошибка 503) — попробуй еще раз через пару секунд.")
 
 async def main():
     await db.init_db()
