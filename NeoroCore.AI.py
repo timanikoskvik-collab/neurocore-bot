@@ -13,11 +13,15 @@ from aiogram.types import (
 )
 from google import genai
 
-TOKEN = os.getenv("TELEGRAM_TOKEN")
+# Токен Telegram (проверяем обе переменные окружения для надежности)
+TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
+# Модель Gemini (по умолчанию gemini-3.6-flash согласно ответу Google API)
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+
 if not TOKEN:
-    raise ValueError("Не найден TELEGRAM_TOKEN!")
+    raise ValueError("Не найден TELEGRAM_TOKEN или BOT_TOKEN в переменных окружения!")
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
@@ -161,8 +165,20 @@ async def generate_image(prompt: str) -> bytes | None:
 
 
 # ==========================================
-# 4. ПОДПИСКИ (TELEGRAM STARS)
+# 4. КОМАНДЫ И ПОДПИСКИ (TELEGRAM STARS)
 # ==========================================
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    tier, images_used = get_user_data(message.from_user.id)
+    text = (
+        "⚡ **NEUROCORE OMEGA (NCO v3.4)**\n\n"
+        f"👤 Ваш статус: **{tier.upper()}**\n"
+        f"🎨 Сгенерировано (Free): **{images_used}/{FREE_IMAGE_LIMIT}** (обновление каждые 24ч)\n\n"
+        "• `/draw <описание>` — сгенерировать картинку\n"
+        "• `/premium` — купить PRO подписку за Stars"
+    )
+    await message.answer(text, parse_mode="Markdown")
+
 @dp.message(Command("premium"))
 async def cmd_premium(message: Message):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -206,22 +222,6 @@ async def successful_payment_handler(message: Message):
     update_user_tier(message.from_user.id, 'pro')
     await message.answer("✨ **Оплата прошла успешно!**\nРежим **PRO** активирован. Все ограничения сняты!", parse_mode="Markdown")
 
-
-# ==========================================
-# 5. ОБРАБОТЧИКИ СООБЩЕНИЙ И ГЕНЕРАЦИЯ
-# ==========================================
-@dp.message(Command("start"))
-async def cmd_start(message: Message):
-    tier, images_used = get_user_data(message.from_user.id)
-    text = (
-        "⚡ **NEUROCORE OMEGA (NCO v3.3)**\n\n"
-        f"👤 Ваш статус: **{tier.upper()}**\n"
-        f"🎨 Сгенерировано (Free): **{images_used}/{FREE_IMAGE_LIMIT}** (обновление каждые 24ч)\n\n"
-        "• `/draw <описание>` — сгенерировать картинку\n"
-        "• `/premium` — купить PRO подписку за Stars"
-    )
-    await message.answer(text, parse_mode="Markdown")
-
 @dp.message(Command("draw"))
 async def cmd_draw(message: Message):
     user_id = message.from_user.id
@@ -262,6 +262,10 @@ async def cmd_draw(message: Message):
         try: await status_msg.edit_text("⚠️ Ошибка генерации. Изображение не создано, лимит не списан.")
         except: pass
 
+
+# ==========================================
+# 5. ОБРАБОТЧИК ЧАТА С ИИ (ВСЕГДА В КОНЦЕ!)
+# ==========================================
 @dp.message()
 async def handle_chat(message: Message):
     user_id = message.from_user.id
@@ -287,16 +291,16 @@ async def handle_chat(message: Message):
                 "Ответь информативно и вежливо на русском языке."
             )
             
-            # ИСПРАВЛЕНО: Правильная модель 'gemini-2.0-flash'
+            # Вызов актуальной модели Gemini
             response = gemini_client.models.generate_content(
-                model='gemini-2.0-flash',
+                model=GEMINI_MODEL,
                 contents=full_prompt,
             )
             if response and response.text:
                 response_text = response.text
         except Exception as e:
-            print(f"❌ Ошибка Gemini API: {e}")
-            response_text = f"⚠️ Ошибка Gemini: {e}"
+            print(f"❌ Ошибка Gemini API ({GEMINI_MODEL}): {e}")
+            response_text = f"⚠️ Ошибка Gemini ({GEMINI_MODEL}): {e}"
 
     save_message_to_db(user_id, "model", response_text)
     await message.answer(response_text, parse_mode="Markdown")
@@ -308,7 +312,7 @@ async def handle_chat(message: Message):
 async def main():
     asyncio.create_task(start_web_server())
     asyncio.create_task(self_ping_task())
-    print("NCO v3.3 успешно запущен!")
+    print(f"NCO v3.4 успешно запущен! Используется модель: {GEMINI_MODEL}")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
