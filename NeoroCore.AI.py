@@ -13,29 +13,21 @@ from aiogram.types import (
 )
 from google import genai
 
-# Токен Telegram (проверяем обе переменные окружения для надежности)
 TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
-# Модель Gemini (по умолчанию gemini-3.6-flash согласно ответу Google API)
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 
 if not TOKEN:
-    raise ValueError("Не найден TELEGRAM_TOKEN или BOT_TOKEN в переменных окружения!")
+    raise ValueError("Не найден TELEGRAM_TOKEN или BOT_TOKEN!")
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# Инициализация клиента Gemini
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 FREE_IMAGE_LIMIT = 3
-RESET_TIME_SECONDS = 86400  # 24 часа
+RESET_TIME_SECONDS = 86400
 
-
-# ==========================================
-# 1. БАЗА ДАННЫХ И ЛИМИТЫ (С ТАЙМЕРОМ)
-# ==========================================
 def init_db():
     conn = sqlite3.connect("nco_database.db")
     cursor = conn.cursor()
@@ -74,8 +66,6 @@ def get_user_data(user_id: int):
         return 'free', 0
 
     tier, images_used, last_reset = row
-    
-    # Сброс лимитов каждые 24 часа
     if now - last_reset >= RESET_TIME_SECONDS:
         images_used = 0
         cursor.execute("UPDATE users SET images_used = 0, last_reset = ? WHERE user_id = ?", (now, user_id))
@@ -113,10 +103,6 @@ def get_chat_history(user_id: int, limit: int = 10):
     conn.close()
     return list(reversed(rows))
 
-
-# ==========================================
-# 2. ЗАЩИТА ОТ ЗАСЫПАНИЯ НА RENDER
-# ==========================================
 async def handle_index(request):
     return web.Response(text="NeuroCore Omega (NCO) System is running.")
 
@@ -146,10 +132,6 @@ async def self_ping_task():
                 pass
             await asyncio.sleep(240)
 
-
-# ==========================================
-# 3. ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ
-# ==========================================
 async def generate_image(prompt: str) -> bytes | None:
     encoded_prompt = urllib.parse.quote(prompt.strip())
     image_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true"
@@ -163,15 +145,11 @@ async def generate_image(prompt: str) -> bytes | None:
             print(f"❌ Ошибка генерации фото: {e}")
         return None
 
-
-# ==========================================
-# 4. КОМАНДЫ И ПОДПИСКИ (TELEGRAM STARS)
-# ==========================================
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     tier, images_used = get_user_data(message.from_user.id)
     text = (
-        "⚡ **NEUROCORE OMEGA (NCO v3.4)**\n\n"
+        "⚡ **NEUROCORE OMEGA (NCO v3.5)**\n\n"
         f"👤 Ваш статус: **{tier.upper()}**\n"
         f"🎨 Сгенерировано (Free): **{images_used}/{FREE_IMAGE_LIMIT}** (обновление каждые 24ч)\n\n"
         "• `/draw <описание>` — сгенерировать картинку\n"
@@ -207,7 +185,7 @@ async def process_buy_callback(callback: CallbackQuery):
         title=f"Подписка NCO PRO ({months} мес.)",
         description="Безлимитная генерация картинок и приоритетный доступ.",
         payload=f"pro_{months}_months",
-        provider_token="", # Для Telegram Stars оставляем пустым
+        provider_token="",
         currency="XTR",
         prices=prices
     )
@@ -241,8 +219,6 @@ async def cmd_draw(message: Message):
         return
     
     status_msg = await message.answer(f"⏳ Генерация арта ({tier.upper()} тариф)...")
-    if tier == 'free': await asyncio.sleep(2)
-
     prompt = args[1]
     image_data = await generate_image(prompt)
     
@@ -262,10 +238,6 @@ async def cmd_draw(message: Message):
         try: await status_msg.edit_text("⚠️ Ошибка генерации. Изображение не создано, лимит не списан.")
         except: pass
 
-
-# ==========================================
-# 5. ОБРАБОТЧИК ЧАТА С ИИ (ВСЕГДА В КОНЦЕ!)
-# ==========================================
 @dp.message()
 async def handle_chat(message: Message):
     user_id = message.from_user.id
@@ -291,11 +263,13 @@ async def handle_chat(message: Message):
                 "Ответь информативно и вежливо на русском языке."
             )
             
-            # Вызов актуальной модели Gemini
-            response = gemini_client.models.generate_content(
+            # Асинхронный вызов в отдельном потоке (без блокировки бота)
+            response = await asyncio.to_thread(
+                gemini_client.models.generate_content,
                 model=GEMINI_MODEL,
-                contents=full_prompt,
+                contents=full_prompt
             )
+            
             if response and response.text:
                 response_text = response.text
         except Exception as e:
@@ -305,14 +279,10 @@ async def handle_chat(message: Message):
     save_message_to_db(user_id, "model", response_text)
     await message.answer(response_text, parse_mode="Markdown")
 
-
-# ==========================================
-# 6. ЗАПУСК
-# ==========================================
 async def main():
     asyncio.create_task(start_web_server())
     asyncio.create_task(self_ping_task())
-    print(f"NCO v3.4 успешно запущен! Используется модель: {GEMINI_MODEL}")
+    print(f"NCO v3.5 запущен! Используется модель: {GEMINI_MODEL}")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
