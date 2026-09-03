@@ -21,6 +21,8 @@ if not TOKEN:
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
+
+# Инициализация клиента Gemini
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 FREE_IMAGE_LIMIT = 3
@@ -112,7 +114,7 @@ def get_chat_history(user_id: int, limit: int = 10):
 # 2. ЗАЩИТА ОТ ЗАСЫПАНИЯ НА RENDER
 # ==========================================
 async def handle_index(request):
-    return web.Response(text="NeuroCore Omega (NCO) is running.")
+    return web.Response(text="NeuroCore Omega (NCO) System is running.")
 
 async def start_web_server():
     app = web.Application()
@@ -153,8 +155,8 @@ async def generate_image(prompt: str) -> bytes | None:
             async with session.get(image_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=35) as resp:
                 if resp.status == 200:
                     return await resp.read()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"❌ Ошибка генерации фото: {e}")
         return None
 
 
@@ -170,7 +172,11 @@ async def cmd_premium(message: Message):
         [InlineKeyboardButton(text="⭐ 12 Месяцев - 250 Stars", callback_data="buy_12")],
         [InlineKeyboardButton(text="⭐ 24 Месяца - 450 Stars", callback_data="buy_24")]
     ])
-    await message.answer("💎 **NCO PRO Режим**\nСнимает все лимиты на генерацию и включает максимальный приоритет. Выберите тариф:", reply_markup=keyboard, parse_mode="Markdown")
+    await message.answer(
+        "💎 **NCO PRO Режим**\n\nСнимает все лимиты на генерацию изображений и дает приоритет при общении с нейросетью.\n\nВыберите период подписки:", 
+        reply_markup=keyboard, 
+        parse_mode="Markdown"
+    )
 
 @dp.callback_query(F.data.startswith("buy_"))
 async def process_buy_callback(callback: CallbackQuery):
@@ -178,14 +184,14 @@ async def process_buy_callback(callback: CallbackQuery):
     prices_stars = {1: 25, 3: 70, 6: 130, 12: 250, 24: 450}
     stars_amount = prices_stars.get(months, 25)
     
-    prices = [LabeledPrice(label=f"PRO Режим ({months} мес.)", amount=stars_amount)]
+    prices = [LabeledPrice(label=f"PRO Подписка ({months} мес.)", amount=stars_amount)]
     
     await bot.send_invoice(
         chat_id=callback.message.chat.id,
         title=f"Подписка NCO PRO ({months} мес.)",
-        description="Безлимитная генерация и приоритетный доступ к нейросетям.",
+        description="Безлимитная генерация картинок и приоритетный доступ.",
         payload=f"pro_{months}_months",
-        provider_token="", # Для Telegram Stars токен провайдера должен быть пустым
+        provider_token="", # Для Telegram Stars оставляем пустым
         currency="XTR",
         prices=prices
     )
@@ -198,7 +204,7 @@ async def pre_checkout_handler(pre_checkout_query: PreCheckoutQuery):
 @dp.message(F.successful_payment)
 async def successful_payment_handler(message: Message):
     update_user_tier(message.from_user.id, 'pro')
-    await message.answer("✨ Оплата прошла успешно! Режим **PRO** активирован. Все ограничения сняты.", parse_mode="Markdown")
+    await message.answer("✨ **Оплата прошла успешно!**\nРежим **PRO** активирован. Все ограничения сняты!", parse_mode="Markdown")
 
 
 # ==========================================
@@ -208,11 +214,11 @@ async def successful_payment_handler(message: Message):
 async def cmd_start(message: Message):
     tier, images_used = get_user_data(message.from_user.id)
     text = (
-        "⚡ **NEUROCORE OMEGA (NCO v3.2)**\n\n"
-        f"👤 Статус: **{tier.upper()}**\n"
-        f"🎨 Генераций (Free): **{images_used}/{FREE_IMAGE_LIMIT}** (сброс каждые 24ч)\n\n"
-        "• `/draw <запрос>` — генерация фото\n"
-        "• `/premium` — покупка подписки за Stars"
+        "⚡ **NEUROCORE OMEGA (NCO v3.3)**\n\n"
+        f"👤 Ваш статус: **{tier.upper()}**\n"
+        f"🎨 Сгенерировано (Free): **{images_used}/{FREE_IMAGE_LIMIT}** (обновление каждые 24ч)\n\n"
+        "• `/draw <описание>` — сгенерировать картинку\n"
+        "• `/premium` — купить PRO подписку за Stars"
     )
     await message.answer(text, parse_mode="Markdown")
 
@@ -222,19 +228,19 @@ async def cmd_draw(message: Message):
     tier, images_used = get_user_data(user_id)
     
     if tier == 'free' and images_used >= FREE_IMAGE_LIMIT:
-        await message.answer("⚠️ **Лимит исчерпан!**\n3 бесплатные попытки обновятся через 24 часа. Активируйте безлимит: `/premium`.", parse_mode="Markdown")
+        await message.answer("⚠️ **Лимит исчерпан!**\n3 бесплатные попытки обновляются раз в 24 часа. Снимите ограничения командой `/premium`.", parse_mode="Markdown")
         return
 
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
         await message.answer(
-            "⚠️ Укажи текстовый запрос, например: `/draw cyberpunk car`\n\n"
-            "❗️ *Важно: для лучшего и точного результата пиши запрос на английском языке!*", 
+            "⚠️ Укажи текстовый запрос, например: `/draw cyberpunk city`\n\n"
+            "❗️ *Важно: нейросеть лучше всего понимает запросы на английском языке!*", 
             parse_mode="Markdown"
         )
         return
     
-    status_msg = await message.answer(f"⏳ Генерация концепта ({tier.upper()} тариф)...")
+    status_msg = await message.answer(f"⏳ Генерация арта ({tier.upper()} тариф)...")
     if tier == 'free': await asyncio.sleep(2)
 
     prompt = args[1]
@@ -253,7 +259,7 @@ async def cmd_draw(message: Message):
         try: await status_msg.delete()
         except: pass
     else:
-        try: await status_msg.edit_text("⚠️ Сбой ИИ. Изображение не создано, лимит не списан.")
+        try: await status_msg.edit_text("⚠️ Ошибка генерации. Изображение не создано, лимит не списан.")
         except: pass
 
 @dp.message()
@@ -265,22 +271,36 @@ async def handle_chat(message: Message):
     save_message_to_db(user_id, "user", user_text)
     history = get_chat_history(user_id, limit=6)
     
-    response_text = f"🧠 **NCO [{tier.upper()}]**:\nЗапрос обработан. Ваше сообщение: {user_text}"
-    
+    response_text = "⚠️ Ошибка связи с Gemini. Проверь GEMINI_API_KEY."
+
     if gemini_client:
         try:
-            contents = "\n".join([f"{h[0]}: {h[1]}" for h in history])
+            formatted_history = ""
+            for role, content in history:
+                r_name = "Пользователь" if role == "user" else "Ассистент"
+                formatted_history += f"{r_name}: {content}\n"
+            
+            full_prompt = (
+                "Ты — умный ИИ-помощник NeuroCore Omega (NCO).\n"
+                f"История диалога:\n{formatted_history}\n"
+                f"Пользователь: {user_text}\n"
+                "Ответь информативно и вежливо на русском языке."
+            )
+            
+            # ИСПРАВЛЕНО: Правильная модель 'gemini-2.0-flash'
             response = gemini_client.models.generate_content(
-                model='gemini-2.5-flash',
-                contents=contents,
+                model='gemini-2.0-flash',
+                contents=full_prompt,
             )
             if response and response.text:
                 response_text = response.text
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"❌ Ошибка Gemini API: {e}")
+            response_text = f"⚠️ Ошибка Gemini: {e}"
 
     save_message_to_db(user_id, "model", response_text)
     await message.answer(response_text, parse_mode="Markdown")
+
 
 # ==========================================
 # 6. ЗАПУСК
@@ -288,7 +308,7 @@ async def handle_chat(message: Message):
 async def main():
     asyncio.create_task(start_web_server())
     asyncio.create_task(self_ping_task())
-    print("NCO v3.2 запущен с оплатой Stars, сбросом лимитов 24ч и защитой от сна!")
+    print("NCO v3.3 успешно запущен!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
