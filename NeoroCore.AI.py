@@ -9,7 +9,6 @@ from aiogram.filters import Command
 from aiogram.types import Message, BufferedInputFile
 from google import genai
 
-# Инициализация переменных окружения с учетом TELEGRAM_TOKEN
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
@@ -21,9 +20,11 @@ dp = Dispatcher()
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
+FREE_IMAGE_LIMIT = 3
+
 
 # ==========================================
-# 1. БАЗА ДАННЫХ (История чатов и Про-статус)
+# 1. БАЗА ДАННЫХ И ЛИМИТЫ
 # ==========================================
 def init_db():
     conn = sqlite3.connect("nco_database.db")
@@ -31,7 +32,8 @@ def init_db():
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
-            tier TEXT DEFAULT 'free'
+            tier TEXT DEFAULT 'free',
+            images_used INTEGER DEFAULT 0
         )
     """)
     cursor.execute("""
@@ -47,18 +49,25 @@ def init_db():
 
 init_db()
 
-def get_user_tier(user_id: int) -> str:
+def get_user_data(user_id: int):
     conn = sqlite3.connect("nco_database.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT tier FROM users WHERE user_id = ?", (user_id,))
+    cursor.execute("SELECT tier, images_used FROM users WHERE user_id = ?", (user_id,))
     row = cursor.fetchone()
     if not row:
-        cursor.execute("INSERT INTO users (user_id, tier) VALUES (?, 'free')", (user_id,))
+        cursor.execute("INSERT INTO users (user_id, tier, images_used) VALUES (?, 'free', 0)", (user_id,))
         conn.commit()
         conn.close()
-        return 'free'
+        return 'free', 0
     conn.close()
-    return row[0]
+    return row[0], row[1]
+
+def increment_user_images(user_id: int):
+    conn = sqlite3.connect("nco_database.db")
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET images_used = images_used + 1 WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
 
 def save_message_to_db(user_id: int, role: str, content: str):
     conn = sqlite3.connect("nco_database.db")
@@ -110,7 +119,7 @@ async def self_ping_task():
 
 
 # ==========================================
-# 3. ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ (Pollinations)
+# 3. ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ
 # ==========================================
 async def generate_image(prompt: str) -> bytes | None:
     clean_prompt = prompt.strip()
@@ -129,18 +138,18 @@ async def generate_image(prompt: str) -> bytes | None:
 
 
 # ==========================================
-# 4. ОБРАБОТЧИКИ СООБЩЕНИЙ И КОМАНД
+# 4. ОБРАБОТЧИКИ КОМАНД И ЛИМИТОВ
 # ==========================================
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     user_id = message.from_user.id
-    tier = get_user_tier(user_id)
+    tier, images_used = get_user_data(user_id)
     text = (
         "⚡ **NEUROCORE OMEGA (NCO v3.1)**\n\n"
-        f"Ваш статус: **{tier.upper()}**\n"
-        "• Контекст чата и история сохраняются автоматически в базе данных.\n"
-        "• Генерация графики: `/draw <описание>`\n"
-        "• Переключение в Pro-режим: `/pro`"
+        f"👤 Статус: **{tier.upper()}**\n"
+        f"🎨 Использовано генераций (Free): **{images_used}/{FREE_IMAGE_LIMIT}**\n\n"
+        "• История чатов сохраняется в базе данных.\n"
+        "• Команды: `/draw <описание>`, `/pro` (активация безлимита)"
     )
     await message.answer(text, parse_mode="Markdown")
 
@@ -151,56 +160,70 @@ async def cmd_pro(message: Message):
     cursor.execute("UPDATE users SET tier = 'pro' WHERE user_id = ?", (message.from_user.id,))
     conn.commit()
     conn.close()
-    await message.answer("✨ Режим **PRO** успешно активирован!", parse_mode="Markdown")
+    await message.answer("✨ Режим **PRO** активирован! Лимиты на генерацию сняты.", parse_mode="Markdown")
 
 @dp.message(Command("draw"))
 async def cmd_draw(message: Message):
     user_id = message.from_user.id
-    tier = get_user_tier(user_id)
+    tier, images_used = get_user_data(user_id)
     
-    if tier == 'free':
-        status_msg = await message.answer("⏳ Free-режим: ожидание очереди...")
-        await asyncio.sleep(4)
-    else:
-        status_msg = await message.answer("⚡ Pro-режим: мгновенная генерация концепта...")
+    # Проверка лимитов для Free пользователей
+    if tier == 'free' and images_used >= FREE_IMAGE_LIMIT:
+        await message.answer(
+            f"⚠️ **Лимит исчерпан!**\nВы использовали все бесплатные генерации ({FREE_IMAGE_LIMIT}/{FREE_IMAGE_LIMIT}).\nАктивируйте безлимитный режим командой `/pro`.",
+            parse_mode="Markdown"
+        )
+        return
 
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
-        await status_msg.edit_text("⚠️ Укажи текстовый запрос, например: `/draw киберпанк город`", parse_mode="Markdown")
+        await message.answer("⚠️ Укажи текстовый запрос, например: `/draw cyberpunk cat`", parse_mode="Markdown")
         return
     
+    status_msg = await message.answer(f"⏳ Генерация концепта ({tier.upper()} тариф)...")
+    
+    if tier == 'free':
+        await asyncio.sleep(3) # Очередь для бесплатных пользователей
+
     prompt = args[1]
     image_data = await generate_image(prompt)
     
     if image_data:
+        increment_user_images(user_id)
+        _, updated_used = get_user_data(user_id)
+        
         photo = BufferedInputFile(image_data, filename="nco_art.jpg")
-        await message.answer_photo(photo=photo, caption=f"🎨 Запрос: {prompt}\n👤 Тариф: {tier.upper()}")
+        caption = f"🎨 Запрос: {prompt}\n👤 Тариф: {tier.upper()}"
+        if tier == 'free':
+            caption += f"\n📊 Осталось попыток: {FREE_IMAGE_LIMIT - updated_used}"
+            
+        await message.answer_photo(photo=photo, caption=caption)
         try:
             await status_msg.delete()
         except:
             pass
     else:
         try:
-            await status_msg.edit_text("⚠️ Не удалось сгенерировать изображение.")
+            await status_msg.edit_text("⚠️ Не удалось сгенерировать изображение. Лимит не списан.")
         except:
             await message.answer("⚠️ Не удалось сгенерировать изображение.")
 
 @dp.message()
 async def handle_chat(message: Message):
     user_id = message.from_user.id
-    tier = get_user_tier(user_id)
+    tier, _ = get_user_data(user_id)
     user_text = message.text
 
     save_message_to_db(user_id, "user", user_text)
     history = get_chat_history(user_id, limit=6)
     
     if tier == 'free':
-        await asyncio.sleep(2)
-        model_name = "Gemini Flash (Free)"
+        await asyncio.sleep(1)
+        model_name = "Gemini Flash (Free Tier)"
     else:
-        model_name = "Gemini Flash (Pro)"
+        model_name = "Gemini Flash (Pro Tier - High Priority)"
 
-    response_text = f"🧠 **NCO Terminal [{model_name}]**:\nЗапрос обработан.\nВаш текст: {user_text}"
+    response_text = f"🧠 **NCO Terminal [{model_name}]**:\nЗапрос обработан с учетом истории.\nВаш текст: {user_text}"
     
     if gemini_client:
         try:
@@ -225,7 +248,7 @@ async def main():
     asyncio.create_task(start_web_server())
     asyncio.create_task(self_ping_task())
     
-    print("NeuroCore Omega (NCO) запущен с поддержкой базы данных и защиты от сна!")
+    print("NeuroCore Omega (NCO) запущен с жесткими лимитами, БД и защитой от сна!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
