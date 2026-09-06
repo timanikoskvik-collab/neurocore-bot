@@ -1,150 +1,105 @@
 import os
 import time
-from typing import Optional, Dict, Any, List
 from motor.motor_asyncio import AsyncIOMotorClient
-from bson import ObjectId
+from bson.objectid import ObjectId
 
-MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
-client = AsyncIOMotorClient(MONGO_URI)
-db = client["neurocore_db"]
-
-users_col = db["users"]
-chats_col = db["chats"]
-
-TIER_LIMITS = {
+# Настройки лимитов
+LIMITS = {
     "free": {"text": 40, "photo": 3, "draw": 1},
     "pro": {"text": 100, "photo": 30, "draw": 10}
 }
 
+class Database:
+    def __init__(self):
+        self.client = AsyncIOMotorClient(os.environ.get("MONGO_URI"))
+        self.db = self.client.neurocore_db
+        self.users = self.db.users
+        self.chats = self.db.chats
 
-async def get_or_create_user(user_id: int, username: Optional[str] = None) -> Dict[str, Any]:
-
-    now = time.time()
-    user = await users_col.find_one({"_id": user_id})
-
-    if not user:
-        user = {
-            "_id": user_id,
-            "username": username,
-            "tier": "free",
-            "last_reset": now,
-            "text_count": 0,
-            "photo_count": 0,
-            "draw_count": 0,
-            "current_chat_id": None
-        }
-        await users_col.insert_one(user)
+    async def get_user(self, user_id: int):
+        user = await self.users.find_one({"user_id": user_id})
+        current_time = int(time.time())
+        
+        if not user:
+            user = {
+                "user_id": user_id,
+                "tier": "free",
+                "text_limit": LIMITS["free"]["text"],
+                "photo_limit": LIMITS["free"]["photo"],
+                "draw_limit": LIMITS["free"]["draw"],
+                "last_reset": current_time,
+                "current_chat_id": None
+            }
+            await self.users.insert_one(user)
+        else:
+            # Проверка на сброс лимитов (86400 сек = 24 часа)
+            if current_time - user.get("last_reset", 0) > 86400:
+                tier = user.get("tier", "free")
+                await self.users.update_one(
+                    {"user_id": user_id},
+                    {"$set": {
+                        "text_limit": LIMITS[tier]["text"],
+                        "photo_limit": LIMITS[tier]["photo"],
+                        "draw_limit": LIMITS[tier]["draw"],
+                        "last_reset": current_time
+                    }}
+                )
+                user = await self.users.find_one({"user_id": user_id})
         return user
 
-    if now - user.get("last_reset", 0) >= 86400:
-        await users_col.update_one(
-            {"_id": user_id},
-            {
-                "$set": {
-                    "last_reset": now,
-                    "text_count": 0,
-                    "photo_count": 0,
-                    "draw_count": 0
-                }
-            }
+    async def decrement_limit(self, user_id: int, limit_type: str):
+        await self.users.update_one(
+            {"user_id": user_id},
+            {"$inc": {f"{limit_type}_limit": -1}}
         )
-        user["last_reset"] = now
-        user["text_count"] = 0
-        user["photo_count"] = 0
-        user["draw_count"] = 0
 
-    return user
+    async def upgrade_to_pro(self, user_id: int):
+        await self.users.update_one(
+            {"user_id": user_id},
+            {"$set": {
+                "tier": "pro",
+                "text_limit": LIMITS["pro"]["text"],
+                "photo_limit": LIMITS["pro"]["photo"],
+                "draw_limit": LIMITS["pro"]["draw"],
+                "last_reset": int(time.time())
+            }}
+        )
 
+    async def create_chat(self, user_id: int, title: str):
+        chat_doc = {
+            "user_id": user_id,
+            "title": title[:25],
+            "messages": [],
+            "updated_at": int(time.time())
+        }
+        result = await self.chats.insert_one(chat_doc)
+        chat_id = str(result.inserted_id)
+        await self.set_current_chat(user_id, chat_id)
+        return chat_id
 
-async def check_and_increment_limit(user_id: int, limit_type: str) -> tuple[bool, int, int]:
+    async def get_chat(self, chat_id: str):
+        if not chat_id:
+            return None
+        return await self.chats.find_one({"_id": ObjectId(chat_id)})
 
-    user = await get_or_create_user(user_id)
-    tier = user.get("tier", "free")
-    max_limit = TIER_LIMITS.get(tier, TIER_LIMITS["free"]).get(limit_type, 0)
-    current_count = user.get(f"{limit_type}_count", 0)
-
-    if current_count >= max_limit:
-        return False, current_count, max_limit
-
-    await users_col.update_one(
-        {"_id": user_id},
-        {"$inc": {f"{limit_type}_count": 1}}
-    )
-    return True, current_count + 1, max_limit
-
-
-async def set_user_tier(user_id: int, tier: str) -> None:
-
-    await users_col.update_one(
-        {"_id": user_id},
-        {"$set": {"tier": tier}}
-    )
-
-
-async def get_current_chat_id(user_id: int) -> Optional[str]:
-
-    user = await get_or_create_user(user_id)
-    return user.get("current_chat_id")
-
-
-async def set_current_chat_id(user_id: int, chat_id: Optional[str]) -> None:
-
-    await users_col.update_one(
-        {"_id": user_id},
-        {"$set": {"current_chat_id": chat_id}}
-    )
-
-
-async def create_chat_room(user_id: int, first_message_text: str) -> str:
-
-    title = first_message_text[:25].strip() if first_message_text else "Новый диалог"
-    now = time.time()
-    
-    new_chat = {
-        "user_id": user_id,
-        "title": title,
-        "created_at": now,
-        "updated_at": now,
-        "messages": []
-    }
-    result = await chats_col.insert_one(new_chat)
-    chat_id = str(result.inserted_id)
-    
-    await set_current_chat_id(user_id, chat_id)
-    return chat_id
-
-
-async def append_message_to_chat(chat_id: str, role: str, text: str) -> None:
-
-    try:
-        obj_id = ObjectId(chat_id)
-        await chats_col.update_one(
-            {"_id": obj_id},
+    async def add_message(self, chat_id: str, role: str, text: str):
+        await self.chats.update_one(
+            {"_id": ObjectId(chat_id)},
             {
                 "$push": {"messages": {"role": role, "text": text}},
-                "$set": {"updated_at": time.time()}
+                "$set": {"updated_at": int(time.time())}
             }
         )
-    except Exception:
-        pass
 
+    async def get_recent_chats(self, user_id: int, limit=10):
+        cursor = self.chats.find({"user_id": user_id}).sort("updated_at", -1).limit(limit)
+        return await cursor.to_list(length=limit)
 
-async def get_chat_history(chat_id: str) -> List[Dict[str, str]]:
+    async def set_current_chat(self, user_id: int, chat_id: str | None):
+        await self.users.update_one(
+            {"user_id": user_id},
+            {"$set": {"current_chat_id": chat_id}}
+        )
 
-    try:
-        chat = await chats_col.find_one({"_id": ObjectId(chat_id)})
-        return chat.get("messages", []) if chat else []
-    except Exception:
-        return []
-
-
-async def get_recent_chats(user_id: int, limit: int = 10) -> List[Dict[str, Any]]:
-
-    cursor = chats_col.find({"user_id": user_id}).sort("updated_at", -1).limit(limit)
-    chats = []
-    async for chat in cursor:
-        chats.append({
-            "id": str(chat["_id"]),
-            "title": chat.get("title", "Без названия")
-        })
-    return chats
+# Глобальный экземпляр для импорта
+db = Database()
