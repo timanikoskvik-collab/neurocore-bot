@@ -1,15 +1,12 @@
 import os
 import time
-from typing import Dict, Any, List, Optional
-from bson.objectid import ObjectId
+from typing import Dict, Any
 from motor.motor_asyncio import AsyncIOMotorClient
 
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 client = AsyncIOMotorClient(MONGO_URI)
 db = client["neurocore_db"]
-
 users_collection = db["users"]
-chats_collection = db["chats"]
 
 TIERS = {
     "free": {
@@ -41,8 +38,7 @@ async def get_or_create_user(user_id: int, username: str = None) -> Dict[str, An
             "text_count": 0,
             "photo_count": 0,
             "draw_count": 0,
-            "last_reset": now,
-            "current_chat_id": None
+            "last_reset": now
         }
         await users_collection.insert_one(user)
     else:
@@ -116,56 +112,4 @@ async def activate_pro_subscription(user_id: int, months: int):
             }
         }
     )
-
-async def create_new_chat(user_id: int, first_message: str) -> str:
-    title = first_message[:30] + "..." if len(first_message) > 30 else first_message
-    chat_data = {
-        "user_id": user_id,
-        "title": title,
-        "created_at": time.time(),
-        "messages": []
-    }
-    result = await chats_collection.insert_one(chat_data)
-    chat_id = str(result.inserted_id)
-
-    await users_collection.update_one(
-        {"user_id": user_id},
-        {"$set": {"current_chat_id": chat_id}}
-    )
-    return chat_id
-
-async def set_current_chat(user_id: int, chat_id: Optional[str]):
-    await users_collection.update_one(
-        {"user_id": user_id},
-        {"$set": {"current_chat_id": chat_id}}
-    )
-
-async def add_message_to_chat(chat_id: str, role: str, content: str):
-    try:
-        await chats_collection.update_one(
-            {"_id": ObjectId(chat_id)},
-            {"$push": {"messages": {"role": role, "content": content, "timestamp": time.time()}}}
-        )
-    except Exception:
-        pass
-
-async def get_chat_history(chat_id: str, limit: int = 10) -> List[Dict[str, str]]:
-    try:
-        chat = await chats_collection.find_one({"_id": ObjectId(chat_id)})
-        if chat and "messages" in chat:
-            return chat["messages"][-limit:]
-    except Exception:
-        pass
-    return []
-
-async def get_user_recent_chats(user_id: int, limit: int = 10) -> List[Dict[str, Any]]:
-    cursor = chats_collection.find({"user_id": user_id}).sort("created_at", -1).limit(limit)
-    chats = []
-    async for doc in cursor:
-        chats.append({
-            "id": str(doc["_id"]),
-            "title": doc.get("title", "Диалог"),
-            "created_at": doc.get("created_at")
-        })
-    return chats
     
