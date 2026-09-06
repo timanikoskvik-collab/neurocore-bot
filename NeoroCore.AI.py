@@ -12,6 +12,8 @@
 import os
 import asyncio
 import logging
+import urllib.parse
+import aiohttp
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import CommandStart, Command
@@ -115,7 +117,7 @@ async def process_buy_pro(message: types.Message) -> None:
 
 
 @dp.message(F.text == "🎨 Сгенерировать арт")
-async def btn_draw_info(message: types.Message) -> Noneвлечении) -> None:
+async def btn_draw_info(message: types.Message) -> None:
     """Подсказка для пользователя о том, как правильно запускать генерацию графики."""
     prompt_help = (
         "🎨 <b>Создание произведений искусства</b>\n\n"
@@ -295,7 +297,7 @@ async def main() -> None:
     port_number = int(os.getenv("PORT", 8080))
     site_listener = web.TCPSite(server_runner, "0.0.0.0", port_number)
     await site_listener.start()
-    logger.logger_status = logger.info(f"Веб-сервер успешно запущен на порту {port_number}")
+    logger.info(f"Веб-сервер успешно запущен на порту {port_number}")
 
     # Сброс зависших вебхуков для предотвращения ошибок ConflictError при перезапуске
     await bot.delete_webhook(drop_pending_updates=True)
@@ -309,3 +311,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logger.info("Работа бота NeuroCore Omega AI штатно завершена.")
+ 
