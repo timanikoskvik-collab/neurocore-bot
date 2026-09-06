@@ -1,4 +1,4 @@
-aiogram
-aiosqlite
+aiogram>=3.0.0
+motor>=3.0.0
 google-genai
-Pillow
+aiohttp
