@@ -11,19 +11,20 @@ db = client["neurocore_db"]
 users_collection = db["users"]
 chats_collection = db["chats"]
 
+# Точные конфигурации моделей и тарифов
 TIERS = {
     "free": {
         "text_limit": 40,
         "photo_limit": 3,
-        "draw_limit": 1,
-        "genai_model": "gemini-2.0-flash",
-        "model_name": "NCO 2.1 (Free)"
+        "draw_limit": 5,
+        "genai_model": "gemini-3.5-flash",
+        "model_name": "NCO 2.4 (Free)"
     },
     "pro": {
-        "text_limit": 100,
+        "text_limit": 200,
         "photo_limit": 30,
-        "draw_limit": 10,
-        "genai_model": "gemini-2.0-pro-exp-02-05",
+        "draw_limit": 20,
+        "genai_model": "gemini-3.7-flash",
         "model_name": "NCO 3.1 (PRO)"
     }
 }
@@ -53,7 +54,7 @@ async def get_or_create_user(user_id: int, username: str = None) -> Dict[str, An
             )
             user["tier"] = "free"
 
-        # Автоматический сброс лимитов каждые 24 часа
+        # Автоматический сброс лимитов раз в 24 часа
         if now - user.get("last_reset", 0) > 86400:
             await users_collection.update_one(
                 {"user_id": user_id},
@@ -169,3 +170,4 @@ async def get_user_recent_chats(user_id: int, limit: int = 10) -> List[Dict[str,
             "created_at": doc.get("created_at")
         })
     return chats
+            
