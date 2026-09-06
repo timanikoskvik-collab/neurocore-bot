@@ -1,135 +1,84 @@
-import aiosqlite
-import time
+import os
+from datetime import datetime, timedelta
+from pymongo import MongoClient
 
-DB_NAME = "bot_database.db"
+# Подключение к MongoDB Atlas (переменная MONGO_URI на Render)
+db_client = MongoClient(os.environ.get("MONGO_URI"))
+db = db_client["neuro_bot_db"]
+users_col = db["users"]
+chats_col = db["chats"]
 
-FREE_LIMITS = {"msg": 40, "photo": 3, "draw": 1}
-PRO_LIMITS = {"msg": 100, "photo": 20, "draw": 10}
-
-async def init_db():
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                is_premium INTEGER DEFAULT 0,
-                msg_left INTEGER DEFAULT 40,
-                photo_left INTEGER DEFAULT 3,
-                draw_left INTEGER DEFAULT 1,
-                active_session INTEGER DEFAULT 1,
-                last_full_reset REAL DEFAULT 0,
-                last_hourly_bonus REAL DEFAULT 0
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                session_id INTEGER DEFAULT 1,
-                role TEXT,
-                content TEXT,
-                timestamp REAL
-            )
-        """)
-        await db.commit()
-
-async def check_and_update_limits(user_id: int):
-    current_time = time.time()
-    async with aiosqlite.connect(DB_NAME) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as cursor:
-            user = await cursor.fetchone()
-            if not user:
-                try:
-                    await db.execute(
-                        "INSERT INTO users (user_id, msg_left, photo_left, draw_left, active_session, last_full_reset, last_hourly_bonus) VALUES (?, ?, ?, ?, 1, ?, ?)",
-                        (user_id, FREE_LIMITS["msg"], FREE_LIMITS["photo"], FREE_LIMITS["draw"], current_time, current_time)
-                    )
-                    await db.commit()
-                except Exception:
-                    pass
-                async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as cur:
-                    user = await cur.fetchone()
-                return dict(user) if user else {"user_id": user_id, "is_premium": 0, "msg_left": 40, "active_session": 1}
-
-            if current_time - user['last_full_reset'] >= 86400:
-                is_prem = bool(user['is_premium'])
-                limits = PRO_LIMITS if is_prem else FREE_LIMITS
-                await db.execute(
-                    """UPDATE users SET msg_left = ?, photo_left = ?, draw_left = ?, 
-                       last_full_reset = ?, last_hourly_bonus = ? WHERE user_id = ?""",
-                    (limits["msg"], limits["photo"], limits["draw"], current_time, current_time, user_id)
-                )
-                await db.commit()
-                async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as cur:
-                    user = await cur.fetchone()
-                return dict(user)
-            
-            if current_time - user['last_hourly_bonus'] >= 3600:
-                is_prem = bool(user['is_premium'])
-                limits = PRO_LIMITS if is_prem else FREE_LIMITS
-                new_msg = min(user['msg_left'] + 2, limits["msg"])
-                new_photo = min(user['photo_left'] + 1, limits["photo"])
-                new_draw = min(user['draw_left'] + 1, limits["draw"])
-                await db.execute(
-                    """UPDATE users SET msg_left = ?, photo_left = ?, draw_left = ?, last_hourly_bonus = ? WHERE user_id = ?""",
-                    (new_msg, new_photo, new_draw, current_time, user_id)
-                )
-                await db.commit()
-            return dict(user)
-
-async def get_user(user_id: int):
-    return await check_and_update_limits(user_id)
-
-async def set_active_session(user_id: int, session_id: int):
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("UPDATE users SET active_session = ? WHERE user_id = ?", (session_id, user_id))
-        await db.commit()
-
-async def decrement_limit(user_id: int, limit_type: str):
-    column = f"{limit_type}_left"
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(f"UPDATE users SET {column} = {column} - 1 WHERE user_id = ? AND {column} > 0", (user_id,))
-        await db.commit()
-
-async def set_premium(user_id: int, status: bool = True):
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("UPDATE users SET is_premium = ? WHERE user_id = ?", (1 if status else 0, user_id))
-        await db.commit()
-    await check_and_update_limits(user_id)
-
-async def add_message(user_id: int, role: str, content: str, session_id: int = 1):
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(
-            "INSERT INTO history (user_id, session_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)",
-            (user_id, session_id, role, content, time.time())
+def get_user_profile(user_id):
+    """Получает профиль пользователя и сбрасывает суточные лимиты, если прошло 24 часа"""
+    user = users_col.find_one({"user_id": user_id})
+    if not user:
+        user = {
+            "user_id": user_id,
+            "status": "free",  # 'free' или 'pro'
+            "current_chat_id": None,
+            "last_reset": datetime.utcnow(),
+            "usage": {"messages": 0, "photos_in": 0, "photos_gen": 0}
+        }
+        users_col.insert_one(user)
+    
+    # Сброс лимитов раз в 24 часа
+    if datetime.utcnow() - user["last_reset"] >= timedelta(days=1):
+        users_col.update_one(
+            {"user_id": user_id},
+            {"$set": {
+                "usage": {"messages": 0, "photos_in": 0, "photos_gen": 0},
+                "last_reset": datetime.utcnow()
+            }}
         )
-        await db.commit()
+        user = users_col.find_one({"user_id": user_id})
+    return user
 
-async def get_history(user_id: int, session_id: int = 1, limit: int = 10):
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute(
-            "SELECT role, content FROM (SELECT * FROM history WHERE user_id = ? AND session_id = ? ORDER BY timestamp DESC LIMIT ?) ORDER BY timestamp ASC",
-            (user_id, session_id, limit)
-        ) as cursor:
-            rows = await cursor.fetchall()
-            return [{"role": role, "parts": [{"text": content}]} for role, content in rows]
+def create_new_chat(user_id, first_message_text):
+    """Автоматически создает новый чат с коротким заголовком из первого сообщения"""
+    from bson.objectid import ObjectId
+    title = first_message_text[:25] + "..." if len(first_message_text) > 25 else first_message_text
+    new_chat_doc = {
+        "user_id": user_id,
+        "title": title,
+        "messages": [],
+        "updated_at": datetime.utcnow()
+    }
+    insert_result = chats_col.insert_one(new_chat_doc)
+    chat_id = insert_result.inserted_id
+    # Делаем этот чат активным для юзера
+    users_col.update_one({"user_id": user_id}, {"$set": {"current_chat_id": chat_id}})
+    return chat_id
 
-async def clear_history(user_id: int, session_id: int = 1):
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("DELETE FROM history WHERE user_id = ? AND session_id = ?", (user_id, session_id))
-        await db.commit()
+def get_active_chat_history(chat_id):
+    """Загружает историю сообщений конкретного чата"""
+    from bson.objectid import ObjectId
+    chat = chats_col.find_one({"_id": ObjectId(chat_id)})
+    return chat.get("messages", []) if chat else []
 
-async def create_new_session(user_id: int) -> int:
-    """Создает новый уникальный слот чата для пользователя и переключает на него"""
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT MAX(session_id) FROM history WHERE user_id = ?", (user_id,)) as cursor:
-            row = await cursor.fetchone()
-            max_hist = row[0] if row and row[0] else 0
-        async with db.execute("SELECT active_session FROM users WHERE user_id = ?", (user_id,)) as cursor:
-            row = await cursor.fetchone()
-            max_user = row[0] if row and row[0] else 1
-        
-        new_session = max(max_hist, max_user) + 1
-        await db.execute("UPDATE users SET active_session = ? WHERE user_id = ?", (new_session, user_id))
-        await db.commit()
-        return new_session
+def save_message_to_history(chat_id, user_id, user_text, ai_response):
+    """Записывает реплики пользователя и ИИ в историю чата и увеличивает счетчик"""
+    from bson.objectid import ObjectId
+    chats_col.update_one(
+        {"_id": ObjectId(chat_id)},
+        {
+            "$push": {
+                "messages": {
+                    "$each": [
+                        {"role": "user", "text": user_text},
+                        {"role": "model", "text": ai_response}
+                    ]
+                }
+            },
+            "$set": {"updated_at": datetime.utcnow()}
+        }
+    )
+    users_col.update_one({"user_id": user_id}, {"$inc": {"usage.messages": 1}})
+
+def get_recent_chats(user_id, limit=10):
+    """Вытаскивает последние чаты пользователя для списка"""
+    return list(chats_col.find({"user_id": user_id}).sort("updated_at", -1).limit(limit))
+
+def switch_chat(user_id, chat_id_str):
+    """Переключает активный чат пользователя"""
+    from bson.objectid import ObjectId
+    users_col.update_one({"user_id": user_id}, {"$set": {"current_chat_id": ObjectId(chat_id_str)}})
