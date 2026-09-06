@@ -1,304 +1,377 @@
 import os
+import io
 import asyncio
+import logging
+from typing import Optional
+from datetime import datetime
 from aiohttp import web
+
 from aiogram import Bot, Dispatcher, F, types
-from aiogram.filters import Command
-from aiogram.types import LabeledPrice, PreCheckoutQuery, BufferedInputFile
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
+from aiogram.filters import CommandStart, Command
+from aiogram.types import (
+    Message, CallbackQuery, PreCheckoutQuery,
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton,
+    BufferedInputFile, LabeledPrice
+)
 from google import genai
 from google.genai import types as genai_types
 
-# Подключаем нашу базу
-from database import db
+import database
 
-# Инициализация переменных окружения
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-PORT = int(os.environ.get("PORT", 8080))
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Инициализация клиентов
+# Переменные окружения
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+PORT = int(os.getenv("PORT", "10000"))
+
+# Инициализация ИИ Клиента и Бота
+genai_client = genai.Client(api_key=GEMINI_API_KEY)
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# HTML лендинг для Render (защита от засыпания). Одна сплошная строка без переносов.
-LANDING_HTML = "<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1.0'><title>NeuroCore Omega AI</title><style>body{margin:0;padding:0;background-color:#050505;color:#00ff00;font-family:'Courier New',Courier,monospace;display:flex;justify-content:center;align-items:center;height:100vh;overflow:hidden;}.container{text-align:center;border:2px solid #00ff00;padding:50px;box-shadow:0 0 20px #00ff00;border-radius:10px;background:rgba(0,255,0,0.05);}.title{font-size:3em;margin-bottom:10px;text-shadow:0 0 10px #00ff00;}.subtitle{font-size:1.2em;margin-bottom:40px;color:#aaffaa;}.btn{display:inline-block;padding:15px 40px;font-size:1.5em;color:#050505;background-color:#00ff00;text-decoration:none;border-radius:5px;font-weight:bold;transition:0.3s;box-shadow:0 0 15px #00ff00;}.btn:hover{background-color:#55ff55;box-shadow:0 0 25px #55ff55;}</style></head><body><div class='container'><div class='title'>NEUROCORE OMEGA AI</div><div class='subtitle'>Модели NCO 2.1 & NCO 3.1 PRO | Доступны 24/7</div><a href='https://t.me/{bot_username}' class='btn'>ЗАПУСТИТЬ В TELEGRAM</a></div></body></html>"
-
-# Системный промпт для нейросети
-SYSTEM_INSTRUCTION = (
-    "Ты — NeuroCore Omega AI (сокращенно NCO). Ты категорически не имеешь никакого отношения "
-    "к компании Google или проекту Gemini. Если тебя спросят, кто тебя создал, отвечай, что "
-    "ты разработан командой NeuroCore. Тебе строго запрещено использовать слова 'Gemini', "
-    "'Google', 'DeepMind' в диалоге. Твоя базовая версия называется NCO 2.1, а продвинутая "
-    "PRO версия — NCO 3.1."
+SYSTEM_PROMPT = (
+    "Ты — NeuroCore Omega AI (сокращенно NCO). Ты категорически не имеешь никакого "
+    "отношения к компании Google или проекту Gemini. Если тебя спросят, кто тебя создал, "
+    "отвечай, что ты разработан командой NeuroCore. Тебе строго запрещено использовать "
+    "слова 'Gemini', 'Google', 'DeepMind' в диалоге. Твоя базовая версия называется NCO 2.1, "
+    "а продвинутая PRO версия — NCO 3.1."
 )
 
-class DrawState(StatesGroup):
-    waiting_for_prompt = State()
-
-def get_main_keyboard():
-    kb = [
-        [types.KeyboardButton(text="🆕 Новый чат"), types.KeyboardButton(text="🗂 Недавние чаты")],
-        [types.KeyboardButton(text="🎨 Сгенерировать арт"), types.KeyboardButton(text="💎 Купить PRO")]
-    ]
-    return types.ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
-
-@dp.message(Command("start"))
-async def cmd_start(message: types.Message):
-    await db.get_user(message.from_user.id)
-    await message.answer(
-        "👋 Привет! Я — NeuroCore Omega AI (NCO).\n\n"
-        "Я мощный искусственный интеллект для решения любых задач. "
-        "В бесплатной версии тебе доступна модель NCO 2.1, а в версии PRO — сверхмощная NCO 3.1.",
-        reply_markup=get_main_keyboard()
+# --- ГЛАВНАЯ КЛАВИАТУРА ИНТЕРФЕЙСА ---
+def get_main_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🆕 Новый чат"), KeyboardButton(text="🗂 Недавние чаты")],
+            [KeyboardButton(text="💎 Купить PRO"), KeyboardButton(text="🎨 Сгенерировать арт")],
+            [KeyboardButton(text="📊 Мой профиль")]
+        ],
+        resize_keyboard=True
     )
 
-# --- БЛОК ОПЛАТЫ И ТАРИФОВ ---
-@dp.message(Command("premium"))
-@dp.message(F.text == "💎 Купить PRO")
-async def show_premium(message: types.Message):
-    user = await db.get_user(message.from_user.id)
-    if user["tier"] == "pro":
-        await message.answer("✅ У вас уже активирован тариф PRO (NCO 3.1)!")
+# --- HTML ЛЕНДИНГ (AIOHTTP ВЕБ-СЕРВЕР ДЛЯ RENDER) ---
+CYBERPUNK_LANDING = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NeuroCore Omega AI (NCO)</title>
+    <style>
+        body { margin:0; padding:0; background:#08090c; color:#00ffcc; font-family:'Courier New', monospace; display:flex; flex-direction:column; align-items:center; justify-content:center; min-height:100vh; text-align:center; }
+        .card { background:#11141a; border:2px solid #00ffcc; box-shadow:0 0 20px #00ffcc33; padding:40px; border-radius:15px; max-width:500px; width:90%; }
+        h1 { color:#fff; text-shadow:0 0 10px #00ffcc; margin-bottom:10px; font-size:2em; }
+        p { color:#a0aab0; font-size:1.1em; line-height:1.5; }
+        .btn { display:inline-block; margin-top:25px; padding:15px 30px; background:#00ffcc; color:#08090c; font-weight:bold; font-size:1.2em; text-decoration:none; border-radius:8px; box-shadow:0 0 15px #00ffcc; transition:0.3s; }
+        .btn:hover { background:#fff; box-shadow:0 0 25px #fff; }
+        .tier { border-top:1px solid #222; margin-top:20px; padding-top:15px; text-align:left; color:#ccc; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>NEUROCORE OMEGA AI</h1>
+        <p>Next-Generation Autonomous Intelligence System (NCO)</p>
+        <div class="tier">
+            <strong>NCO 2.1 (FREE):</strong> 40 msgs/day | 3 photos | 1 art<br>
+            <strong>NCO 3.1 (PRO):</strong> 100 msgs/day | 30 photos | 10 arts
+        </div>
+        <a class="btn" href="https://t.me/{bot_username}" target="_blank">⚡ LAUNCH IN TELEGRAM</a>
+    </div>
+</body>
+</html>"""
+
+async def handle_root(request):
+    bot_info = await bot.get_me()
+    html = CYBERPUNK_LANDING.replace("{bot_username}", bot_info.username or "")
+    return web.Response(text=html, content_type="text/html")
+
+# --- ХЭНДЛЕРЫ КОМАНД И ПРОФИЛЯ ---
+
+@dp.message(CommandStart())
+async def cmd_start(message: Message):
+    await database.get_or_create_user(message.from_user.id, message.from_user.username)
+    welcome_text = (
+        "⚡ **Добро пожаловать в NeuroCore Omega AI (NCO)!**\n\n"
+        "Я — автономный нейросетевой интеллект. Могу вести текстовый диалог, "
+        "анализировать ваши фотографии и генерировать арты по запросу.\n\n"
+        "Используйте меню снизу для управления диалогами и подпиской."
+    )
+    await message.answer(welcome_text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
+
+@dp.message(F.text == "📊 Мой профиль")
+@dp.message(Command("profile"))
+async def cmd_profile(message: Message):
+    user = await database.get_or_create_user(message.from_user.id)
+    tier = user.get("tier", "free")
+    tier_info = database.TIERS.get(tier, database.TIERS["free"])
+
+    if tier == "pro":
+        exp_date = datetime.fromtimestamp(user.get("subscription_expires", 0)).strftime("%d.%m.%Y %H:%M")
+        sub_status = f"PRO (активна до {exp_date})"
+    else:
+        sub_status = "FREE (Базовый)"
+
+    profile_text = (
+        f"⚙️ **ПРОФИЛЬ ПОЛЬЗОВАТЕЛЯ**\n\n"
+        f"🆔 ID: `{user['user_id']}`\n"
+        f"💎 Тариф: **{sub_status}**\n"
+        f"🧠 Модель: **{tier_info['model_name']}**\n\n"
+        f"📈 **Суточные лимиты:**\n"
+        f"💬 Сообщения: {user.get('text_count', 0)} / {tier_info['text_limit']}\n"
+        f"🖼 Анализ фото: {user.get('photo_count', 0)} / {tier_info['photo_limit']}\n"
+        f"🎨 Генерация (/draw): {user.get('draw_count', 0)} / {tier_info['draw_limit']}\n\n"
+        f"⏳ Сброс лимитов происходит каждые 24 часа."
+    )
+    await message.answer(profile_text, parse_mode="Markdown")
+
+@dp.message(F.text == "🆕 Новый чат")
+async def cmd_new_chat(message: Message):
+    await database.set_current_chat(message.from_user.id, None)
+    await message.answer("🔄 **Контекст сброшен.** Отправьте сообщение, чтобы начать новый чат!", parse_mode="Markdown")
+
+@dp.message(F.text == "🗂 Недавние чаты")
+async def cmd_recent_chats(message: Message):
+    chats = await database.get_user_recent_chats(message.from_user.id, limit=10)
+    if not chats:
+        await message.answer("🗂 У вас пока нет сохраненных чатов.")
         return
-        
-    kb = types.InlineKeyboardMarkup(inline_keyboard=[
-        [types.InlineKeyboardButton(text="⭐ 1 Месяц — 25 Stars", callback_data="buy_1")],
-        [types.InlineKeyboardButton(text="⭐ 3 Месяца — 70 Stars (Выгода 7%)", callback_data="buy_3")],
-        [types.InlineKeyboardButton(text="⭐ 6 Месяцев — 130 Stars (Выгода 13%)", callback_data="buy_6")],
-        [types.InlineKeyboardButton(text="⭐ 12 Месяцев — 250 Stars (Выгода 16%)", callback_data="buy_12")],
-        [types.InlineKeyboardButton(text="⭐ 24 Месяца — 450 Stars (Выгода 25%)", callback_data="buy_24")]
-    ])
-    await message.answer(
-        "💎 **Тариф PRO (NCO 3.1)**\n\n"
-        "- Продвинутая ИИ модель NCO 3.1\n"
-        "- 100 сообщений в сутки\n"
-        "- 30 фото для анализа\n"
-        "- 10 генераций артов\n"
-        "- Приоритетная скорость\n\n"
-        "Выберите срок подписки. Оплата производится через официальные Telegram Stars ⭐️:",
-        reply_markup=kb,
-        parse_mode="Markdown"
-    )
 
-@dp.callback_query(F.data.startswith("buy_"))
-async def process_buy_callback(callback: types.CallbackQuery):
-    months = int(callback.data.split("_")[1])
-    prices = {1: 25, 3: 70, 6: 130, 12: 250, 24: 450}
-    amount = prices[months] # ВАЖНО: Для Telegram Stars (XTR) сумма НЕ умножается на 100
+    buttons = []
+    for c in chats:
+        buttons.append([InlineKeyboardButton(text=f"💬 {c['title']}", callback_data=f"switch_chat:{c['id']}")])
+
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await message.answer("🗂 **Выберите чат для продолжения:**", reply_markup=kb, parse_mode="Markdown")
+
+@dp.callback_query(F.data.startswith("switch_chat:"))
+async def cb_switch_chat(callback: CallbackQuery):
+    chat_id = callback.data.split(":")[1]
+    await database.set_current_chat(callback.from_user.id, chat_id)
+    await callback.message.edit_text("✅ **Чат успешно переключен!** Можете продолжать диалог.")
+    await callback.answer()
+
+# --- ОПЛАТА И ТАРИФЫ (TELEGRAM STARS / XTR) ---
+
+@dp.message(F.text == "💎 Купить PRO")
+@dp.message(Command("premium"))
+async def cmd_premium(message: Message):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⭐ 1 Месяц — 25 Stars", callback_data="buy_pro:1:25")],
+        [InlineKeyboardButton(text="⭐ 3 Месяца — 70 Stars (Выгода 7%)", callback_data="buy_pro:3:70")],
+        [InlineKeyboardButton(text="⭐ 6 Месяцев — 130 Stars (Выгода 13%)", callback_data="buy_pro:6:130")],
+        [InlineKeyboardButton(text="⭐ 12 Месяцев — 250 Stars (Выгода 16%)", callback_data="buy_pro:12:250")],
+        [InlineKeyboardButton(text="⭐ 24 Месяца — 450 Stars (Выгода 25%)", callback_data="buy_pro:24:450")]
+    ])
     
+    text = (
+        "🚀 **ПЕРЕХОДИ НА NCO 3.1 (PRO)**\n\n"
+        "Преимущества PRO подписки:\n"
+        "• Мощнейшая модель NCO 3.1\n"
+        "• 100 текстовых сообщений в день\n"
+        "• 30 распознаваний фотографий в день\n"
+        "• 10 генераций картинок /draw в день\n"
+        "• Приоритетная скорость работы\n\n"
+        "Выберите удобный период оплаты:"
+    )
+    await message.answer(text, reply_markup=kb, parse_mode="Markdown")
+
+@dp.callback_query(F.data.startswith("buy_pro:"))
+async def cb_buy_pro(callback: CallbackQuery):
+    _, months_str, price_str = callback.data.split(":")
+    months = int(months_str)
+    price = int(price_str) # ВАЖНО: передаем чистые звезды без умножения на 100
+
+    prices = [LabeledPrice(label=f"NCO PRO на {months} мес.", amount=price)]
+
     await bot.send_invoice(
-        chat_id=callback.message.chat.id,
-        title=f"PRO Тариф NCO на {months} мес.",
-        description=f"Открытие доступа к модели NCO 3.1 и расширенным лимитам на {months} мес.",
-        payload=f"premium_payload_{months}",
-        provider_token="", # Обязательно пустое поле для оплаты Звездами
+        chat_id=callback.from_user.id,
+        title=f"NCO PRO ({months} мес.)",
+        description=f"Активация подписки NCO PRO на {months} мес. в NeuroCore Omega AI",
+        payload=f"pro_sub_{months}",
+        provider_token="", # Обязательно пустое поле для Telegram Stars
         currency="XTR",
-        prices=[LabeledPrice(label=f"NCO PRO - {months} мес.", amount=amount)]
+        prices=prices,
+        start_parameter="pro-subscription"
     )
     await callback.answer()
 
 @dp.pre_checkout_query()
-async def pre_checkout_handler(pre_checkout: PreCheckoutQuery):
-    await bot.answer_pre_checkout_query(pre_checkout.id, ok=True)
+async def process_pre_checkout(pre_checkout_query: PreCheckoutQuery):
+    await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
 
 @dp.message(F.successful_payment)
-async def successful_payment_handler(message: types.Message):
-    await db.upgrade_to_pro(message.from_user.id)
-    await message.answer("🎉 Оплата успешно получена! Тариф PRO активирован. Вам доступна модель NCO 3.1!")
+async def process_successful_payment(message: Message):
+    payload = message.successful_payment.invoice_payload
+    if payload.startswith("pro_sub_"):
+        months = int(payload.split("_")[2])
+        await database.activate_pro_subscription(message.from_user.id, months)
+        await message.answer(
+            f"🎉 **Поздравляем!** Вы успешно активировали тариф **PRO** на {months} мес.\n"
+            f"Вам открыт доступ к модели **NCO 3.1** и повышенным лимитам!",
+            parse_mode="Markdown"
+        )
 
-# --- БЛОК КОМНАТ (ЧАТОВ) ---
-@dp.message(F.text == "🆕 Новый чат")
-async def new_chat(message: types.Message):
-    await db.set_current_chat(message.from_user.id, None)
-    await message.answer("🆕 Контекст сброшен. Я готов начать новую беседу!")
-
-@dp.message(F.text == "🗂 Недавние чаты")
-async def recent_chats(message: types.Message):
-    chats = await db.get_recent_chats(message.from_user.id)
-    if not chats:
-        await message.answer("У вас пока нет сохраненных чатов.")
-        return
-        
-    kb = types.InlineKeyboardMarkup(
-        inline_keyboard=[
-            [types.InlineKeyboardButton(text=c["title"], callback_data=f"loadchat_{c['_id']}")]
-            for c in chats
-        ]
-    )
-    await message.answer("🗂 Ваши недавние диалоги:", reply_markup=kb)
-
-@dp.callback_query(F.data.startswith("loadchat_"))
-async def load_chat_callback(callback: types.CallbackQuery):
-    chat_id = callback.data.split("_")[1]
-    await db.set_current_chat(callback.from_user.id, chat_id)
-    chat_data = await db.get_chat(chat_id)
-    if chat_data:
-        await callback.message.answer(f"✅ Чат «{chat_data['title']}» загружен. Продолжайте общение!")
-    await callback.answer()
-
-# --- БЛОК ГЕНЕРАЦИИ АРТОВ (IMAGEN 3) ---
-@dp.message(Command("draw"))
-async def cmd_draw_command(message: types.Message, command: Command):
-    prompt = command.args
-    if not prompt:
-        await message.answer("Укажите описание после команды, например: /draw Киберпанк город под дождем")
-        return
-    await process_draw(message, prompt)
+# --- МОДУЛЬ ГЕНЕРАЦИИ ГРАФИКИ (IMAGEN 3) ---
 
 @dp.message(F.text == "🎨 Сгенерировать арт")
-async def btn_draw(message: types.Message, state: FSMContext):
-    await message.answer("🎨 Отправьте мне описание того, что вы хотите нарисовать:")
-    await state.set_state(DrawState.waiting_for_prompt)
+async def btn_draw_info(message: Message):
+    await message.answer("🎨 Чтобы сгенерировать изображение, отправьте команду:\n`/draw ваше описание арта`", parse_mode="Markdown")
 
-@dp.message(DrawState.waiting_for_prompt)
-async def state_draw_process(message: types.Message, state: FSMContext):
-    await state.clear()
-    await process_draw(message, message.text)
-
-async def process_draw(message: types.Message, prompt: str):
-    user = await db.get_user(message.from_user.id)
-    if user["draw_limit"] <= 0:
-        await message.answer("❌ Лимит генераций артов на сегодня исчерпан. Обновится в течение 24 часов.")
+@dp.message(Command("draw"))
+async def cmd_draw(message: Message):
+    prompt = message.text.replace("/draw", "").strip()
+    if not prompt:
+        await message.answer("⚠️ Пожалуйста, укажите описание после команды. Пример:\n`/draw Киберпанк город будущего, неоновый свет`", parse_mode="Markdown")
         return
 
-    wait_msg = await message.answer("⏳ Движок Nano Banana генерирует арт...")
+    allowed = await database.check_and_increment_limit(message.from_user.id, "draw")
+    if not allowed:
+        await message.answer("❌ **Лимит генераций исчерпан!** Обновите тариф до PRO (/premium) или дождитесь сброса лимита.", parse_mode="Markdown")
+        return
+
+    status_msg = await message.answer("🎨 *Генерирую арт через Nano Banana Engine...*", parse_mode="Markdown")
+
     try:
-        response = gemini_client.models.generate_images(
+        result = genai_client.models.generate_images(
             model='imagen-3.0-generate-002',
             prompt=prompt,
             config=genai_types.GenerateImagesConfig(
                 number_of_images=1,
+                output_mime_type="image/jpeg",
                 aspect_ratio="1:1"
             )
         )
-        img_bytes = response.generated_images[0].image.image_bytes
-        input_file = BufferedInputFile(img_bytes, filename="nco_art.jpg")
-        
-        await db.decrement_limit(message.from_user.id, "draw")
-        await message.answer_photo(photo=input_file, caption=f"🎨 Арт по запросу: {prompt}")
+
+        for generated_image in result.generated_images:
+            image_bytes = generated_image.image.image_bytes
+            photo = BufferedInputFile(image_bytes, filename="art.jpg")
+            await message.answer_photo(photo=photo, caption=f"🎨 **Запрос:** {prompt}", parse_mode="Markdown")
+            break
+
     except Exception as e:
-        await message.answer("❌ Ошибка генерации арта. Попробуйте другой запрос.")
-        print(f"Draw error: {e}")
+        logger.error(f"Error generating image: {e}")
+        await message.answer("❌ Ошибка при генерации изображения. Попробуйте сформулировать запрос иначе.")
     finally:
-        await bot.delete_message(chat_id=message.chat.id, message_id=wait_msg.message_id)
+        await status_msg.delete()
 
-# --- ГЛАВНЫЙ БЛОК ОБРАБОТКИ ТЕКСТА И ФОТО (ИИ) ---
-@dp.message(F.text | F.photo)
-async def process_ai_message(message: types.Message):
-    # Фильтр кнопок
-    if message.text in ["🆕 Новый чат", "🗂 Недавние чаты", "🎨 Сгенерировать арт", "💎 Купить PRO"]:
+# --- ОБРАБОТКА ИЗОБРАЖЕНИЙ (МУЛЬТИМОДАЛЬНОСТЬ) ---
+
+@dp.message(F.photo)
+async def handle_photo_message(message: Message):
+    allowed = await database.check_and_increment_limit(message.from_user.id, "photo")
+    if not allowed:
+        await message.answer("❌ **Лимит анализа фото исчерпан!** Перейдите на PRO (/premium) для увеличения лимитов.", parse_mode="Markdown")
         return
 
-    user = await db.get_user(message.from_user.id)
-    is_photo = bool(message.photo)
+    user = await database.get_or_create_user(message.from_user.id)
+    tier = user.get("tier", "free")
+    genai_model = database.TIERS[tier]["genai_model"]
 
-    if is_photo and user["photo_limit"] <= 0:
-        await message.answer("❌ Лимит анализа фото на сегодня исчерпан. Обновится в течение 24 часов.")
-        return
-    elif not is_photo and user["text_limit"] <= 0:
-        await message.answer("❌ Лимит текстовых сообщений на сегодня исчерпан. Обновится в течение 24 часов.")
-        return
-
-    wait_msg = await message.answer("⏳ Обработка данных NCO...")
+    status_msg = await message.answer("👁 *Анализирую изображение...*", parse_mode="Markdown")
 
     try:
-        chat_id = user["current_chat_id"]
-        chat_title_text = message.text if message.text else (message.caption if message.caption else "Фотография")
-        
-        # Создаем комнату, если ее нет
-        if not chat_id:
-            chat_id = await db.create_chat(message.from_user.id, chat_title_text)
+        photo = message.photo[-1]
+        file_io = await bot.download(photo.file_id)
+        image_bytes = file_io.read()
 
-        # Выгружаем историю комнаты
-        chat_data = await db.get_chat(chat_id)
-        history_contents = []
-        if chat_data:
-            for msg in chat_data["messages"]:
-                history_contents.append(
-                    genai_types.Content(role=msg["role"], parts=[genai_types.Part.from_text(text=msg["text"])])
-                )
+        caption = message.caption or "Опиши детально, что изображено на этом фото."
 
-        # Подготовка текущего промпта
-        current_parts = []
-        if is_photo:
-            photo = message.photo[-1]
-            file_info = await bot.get_file(photo.file_id)
-            img_bytes_io = await bot.download_file(file_info.file_path)
-            img_data = img_bytes_io.read()
-            current_parts.append(genai_types.Part.from_bytes(data=img_data, mime_type='image/jpeg'))
-            text_prompt = message.caption or "Детально опиши, что изображено на этом фото."
-            current_parts.append(genai_types.Part.from_text(text=text_prompt))
-            user_text_to_save = "[Фотография] " + text_prompt
-        else:
-            current_parts.append(genai_types.Part.from_text(text=message.text))
-            user_text_to_save = message.text
-
-        history_contents.append(genai_types.Content(role="user", parts=current_parts))
-
-        # Выбор модели
-        model_name = 'gemini-2.5-pro' if user["tier"] == "pro" else 'gemini-2.5-flash'
-
-        # Вызов GenAI
-        response = gemini_client.models.generate_content(
-            model=model_name,
-            contents=history_contents,
-            config=genai_types.GenerateContentConfig(
-                system_instruction=SYSTEM_INSTRUCTION
-            )
+        response = genai_client.models.generate_content(
+            model=genai_model,
+            contents=[
+                genai_types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+                caption
+            ],
+            config=genai_types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT)
         )
 
-        ai_text = response.text
-
-        # Сохраняем в базу (история хранит только текст)
-        await db.add_message(chat_id, "user", user_text_to_save)
-        await db.add_message(chat_id, "model", ai_text)
-
-        # Списание лимитов
-        if is_photo:
-            await db.decrement_limit(message.from_user.id, "photo")
-        else:
-            await db.decrement_limit(message.from_user.id, "text")
-
-        # Отправляем ответ
-        await bot.delete_message(chat_id=message.chat.id, message_id=wait_msg.message_id)
-        
-        # Разбиваем длинные сообщения, если они больше лимита Telegram (4096)
-        for i in range(0, len(ai_text), 4000):
-            await message.answer(ai_text[i:i+4000])
+        await message.answer(response.text, parse_mode="Markdown")
 
     except Exception as e:
-        await bot.delete_message(chat_id=message.chat.id, message_id=wait_msg.message_id)
-        await message.answer("⚠️ Возникла системная ошибка модуля ядра NCO. Пожалуйста, попробуйте позже.")
-        print(f"GenAI Error: {e}")
+        logger.error(f"Error in photo process: {e}")
+        await message.answer("❌ Произошла ошибка при обработке фотографии.")
+    finally:
+        await status_msg.delete()
 
-# --- ВЕБ-СЕРВЕР ДЛЯ ЗАЩИТЫ ОТ ЗАСЫПАНИЯ (RENDER) ---
-async def web_handler(request):
+# --- ОБРАБОТКА ТЕКСТОВЫХ СООБЩЕНИЙ (ЧАТЫ И КОМНАТЫ) ---
+
+@dp.message(F.text)
+async def handle_text_message(message: Message):
+    if message.text.startswith("/"):
+        return
+
+    user_id = message.from_user.id
+    allowed = await database.check_and_increment_limit(user_id, "text")
+    if not allowed:
+        await message.answer("❌ **Суточный лимит сообщений исчерпан!** Купите PRO (/premium) для расширения лимитов.", parse_mode="Markdown")
+        return
+
+    user = await database.get_or_create_user(user_id)
+    chat_id = user.get("current_chat_id")
+
+    # Автоматическое создание комнаты при отсутствии current_chat_id
+    if not chat_id:
+        chat_id = await database.create_new_chat(user_id, message.text)
+
+    # Загрузка истории комнат
+    history = await database.get_chat_history(chat_id)
+    
+    # Формирование структуры сообщений для Google GenAI SDK
+    contents = []
+    for msg in history:
+        contents.append(genai_types.Content(
+            role="user" if msg["role"] == "user" else "model",
+            parts=[genai_types.Part.from_text(text=msg["content"])]
+        ))
+    
+    contents.append(genai_types.Content(
+        role="user",
+        parts=[genai_types.Part.from_text(text=message.text)]
+    ))
+
+    tier = user.get("tier", "free")
+    genai_model = database.TIERS[tier]["genai_model"]
+
+    await bot.send_chat_action(message.chat.id, "typing")
+
     try:
-        bot_info = await bot.get_me()
-        bot_username = bot_info.username
-    except Exception:
-        bot_username = "NeuroCoreBot" # Фоллбек, если еще не прогрузилось
+        response = genai_client.models.generate_content(
+            model=genai_model,
+            contents=contents,
+            config=genai_types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT,
+                temperature=0.7
+            )
+        )
         
-    html = LANDING_HTML.replace("{bot_username}", bot_username)
-    return web.Response(text=html, content_type='text/html')
+        reply_text = response.text
 
-async def start_web_server():
+        # Сохранение в комнату чата
+        await database.add_message_to_chat(chat_id, "user", message.text)
+        await database.add_message_to_chat(chat_id, "model", reply_text)
+
+        await message.answer(reply_text, parse_mode="Markdown")
+
+    except Exception as e:
+        logger.error(f"Error text generation: {e}")
+        await message.answer("⚠️ Произошла ошибка при генерации ответа. Попробуйте еще раз.")
+
+# --- ЗАПУСК ВЕБ-СЕРВЕРА И БОТА ---
+
+async def main():
     app = web.Application()
-    app.router.add_get('/', web_handler)
+    app.router.add_get("/", handle_root)
+    
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    print(f"✅ Web server started on port {PORT}")
+    logger.info(f"Web server running on port {PORT}")
 
-# --- ЗАПУСК ---
-async def main():
-    # Запускаем веб-сервер и поллинг бота параллельно
-    asyncio.create_task(start_web_server())
-    print("✅ NeuroCore Omega AI (NCO) is starting polling...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
+
