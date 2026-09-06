@@ -11,7 +11,6 @@ db = client["neurocore_db"]
 users_collection = db["users"]
 chats_collection = db["chats"]
 
-# Точные конфигурации моделей и тарифов
 TIERS = {
     "free": {
         "text_limit": 40,
@@ -54,7 +53,6 @@ async def get_or_create_user(user_id: int, username: str = None) -> Dict[str, An
             )
             user["tier"] = "free"
 
-        # Автоматический сброс лимитов раз в 24 часа
         if now - user.get("last_reset", 0) > 86400:
             await users_collection.update_one(
                 {"user_id": user_id},
@@ -170,4 +168,4 @@ async def get_user_recent_chats(user_id: int, limit: int = 10) -> List[Dict[str,
             "created_at": doc.get("created_at")
         })
     return chats
-            
+    
