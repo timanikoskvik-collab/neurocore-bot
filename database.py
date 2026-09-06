@@ -1,89 +1,150 @@
 import os
 import time
-from datetime import datetime
+from typing import Optional, Dict, Any, List
 from motor.motor_asyncio import AsyncIOMotorClient
-from bson.objectid import ObjectId
+from bson import ObjectId
 
-# Подключение к облаку через переменную окружения на Render
-MONGO_URI = os.getenv("MONGO_URI")
-mongo_client = AsyncIOMotorClient(MONGO_URI)
-db = mongo_client["neurocore_omega_db"]
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
+client = AsyncIOMotorClient(MONGO_URI)
+db = client["neurocore_db"]
 
 users_col = db["users"]
 chats_col = db["chats"]
 
-async def get_user_data(user_id: int):
-    """Загружает профиль и автоматически сбрасывает суточные лимиты через 24 часа"""
-    user = await users_col.find_one({"user_id": user_id})
-    now = int(time.time())
-    
+TIER_LIMITS = {
+    "free": {"text": 40, "photo": 3, "draw": 1},
+    "pro": {"text": 100, "photo": 30, "draw": 10}
+}
+
+
+async def get_or_create_user(user_id: int, username: Optional[str] = None) -> Dict[str, Any]:
+
+    now = time.time()
+    user = await users_col.find_one({"_id": user_id})
+
     if not user:
         user = {
-            "user_id": user_id,
+            "_id": user_id,
+            "username": username,
             "tier": "free",
-            "current_chat_id": None,
-            "messages_used": 0,
-            "images_used": 0,
-            "last_reset": now
+            "last_reset": now,
+            "text_count": 0,
+            "photo_count": 0,
+            "draw_count": 0,
+            "current_chat_id": None
         }
         await users_col.insert_one(user)
         return user
 
-    # Если прошло 24 часа (86400 секунд), сбрасываем счетчики в 0
     if now - user.get("last_reset", 0) >= 86400:
         await users_col.update_one(
-            {"user_id": user_id},
-            {"$set": {"messages_used": 0, "images_used": 0, "last_reset": now}}
+            {"_id": user_id},
+            {
+                "$set": {
+                    "last_reset": now,
+                    "text_count": 0,
+                    "photo_count": 0,
+                    "draw_count": 0
+                }
+            }
         )
-        user = await users_col.find_one({"user_id": user_id})
-        
+        user["last_reset"] = now
+        user["text_count"] = 0
+        user["photo_count"] = 0
+        user["draw_count"] = 0
+
     return user
 
-async def create_new_chat(user_id: int, first_message: str):
-    """Создает новую комнату чата с автоматическим названием из первого сообщения"""
-    title = first_message[:25] + "..." if len(first_message) > 25 else first_message
+
+async def check_and_increment_limit(user_id: int, limit_type: str) -> tuple[bool, int, int]:
+
+    user = await get_or_create_user(user_id)
+    tier = user.get("tier", "free")
+    max_limit = TIER_LIMITS.get(tier, TIER_LIMITS["free"]).get(limit_type, 0)
+    current_count = user.get(f"{limit_type}_count", 0)
+
+    if current_count >= max_limit:
+        return False, current_count, max_limit
+
+    await users_col.update_one(
+        {"_id": user_id},
+        {"$inc": {f"{limit_type}_count": 1}}
+    )
+    return True, current_count + 1, max_limit
+
+
+async def set_user_tier(user_id: int, tier: str) -> None:
+
+    await users_col.update_one(
+        {"_id": user_id},
+        {"$set": {"tier": tier}}
+    )
+
+
+async def get_current_chat_id(user_id: int) -> Optional[str]:
+
+    user = await get_or_create_user(user_id)
+    return user.get("current_chat_id")
+
+
+async def set_current_chat_id(user_id: int, chat_id: Optional[str]) -> None:
+
+    await users_col.update_one(
+        {"_id": user_id},
+        {"$set": {"current_chat_id": chat_id}}
+    )
+
+
+async def create_chat_room(user_id: int, first_message_text: str) -> str:
+
+    title = first_message_text[:25].strip() if first_message_text else "Новый диалог"
+    now = time.time()
+    
     new_chat = {
         "user_id": user_id,
         "title": title,
-        "messages": [],
-        "updated_at": datetime.utcnow()
+        "created_at": now,
+        "updated_at": now,
+        "messages": []
     }
-    res = await chats_col.insert_one(new_chat)
-    chat_id = res.inserted_id
-    # Делаем созданный чат активным для пользователя
-    await users_col.update_one({"user_id": user_id}, {"$set": {"current_chat_id": chat_id}})
+    result = await chats_col.insert_one(new_chat)
+    chat_id = str(result.inserted_id)
+    
+    await set_current_chat_id(user_id, chat_id)
     return chat_id
 
-async def get_chat_history(chat_id):
-    """Вытаскивает историю сообщений конкретной комнаты"""
-    if not chat_id:
+
+async def append_message_to_chat(chat_id: str, role: str, text: str) -> None:
+
+    try:
+        obj_id = ObjectId(chat_id)
+        await chats_col.update_one(
+            {"_id": obj_id},
+            {
+                "$push": {"messages": {"role": role, "text": text}},
+                "$set": {"updated_at": time.time()}
+            }
+        )
+    except Exception:
+        pass
+
+
+async def get_chat_history(chat_id: str) -> List[Dict[str, str]]:
+
+    try:
+        chat = await chats_col.find_one({"_id": ObjectId(chat_id)})
+        return chat.get("messages", []) if chat else []
+    except Exception:
         return []
-    chat = await chats_col.find_one({"_id": ObjectId(chat_id)})
-    return chat.get("messages", []) if chat else []
 
-async def save_chat_step(chat_id, user_id, user_text, ai_text):
-    """Сохраняет реплики в историю комнаты и накручивает счетчик сообщений"""
-    await chats_col.update_one(
-        {"_id": ObjectId(chat_id)},
-        {
-            "$push": {
-                "messages": {
-                    "$each": [
-                        {"role": "user", "text": user_text},
-                        {"role": "model", "text": ai_text}
-                    ]
-                }
-            },
-            "$set": {"updated_at": datetime.utcnow()}
-        }
-    )
-    await users_col.update_one({"user_id": user_id}, {"$inc": {"messages_used": 1}})
 
-async def get_recent_chats(user_id: int):
-    """Выдает топ-10 последних чатов юзера для вывода кнопок меню (работает мгновенно)"""
-    cursor = chats_col.find({"user_id": user_id}).sort("updated_at", -1).limit(10)
-    return await cursor.to_list(length=10)
+async def get_recent_chats(user_id: int, limit: int = 10) -> List[Dict[str, Any]]:
 
-async def set_active_chat(user_id: int, chat_id_str: str):
-    """Переключает текущую активную комнату пользователя"""
-    await users_col.update_one({"user_id": user_id}, {"$set": {"current_chat_id": ObjectId(chat_id_str)}})
+    cursor = chats_col.find({"user_id": user_id}).sort("updated_at", -1).limit(limit)
+    chats = []
+    async for chat in cursor:
+        chats.append({
+            "id": str(chat["_id"]),
+            "title": chat.get("title", "Без названия")
+        })
+    return chats
