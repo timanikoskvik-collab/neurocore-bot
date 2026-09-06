@@ -4,37 +4,31 @@ from typing import Dict, Any, List, Optional
 from bson.objectid import ObjectId
 from motor.motor_asyncio import AsyncIOMotorClient
 
-# Подключение к MongoDB
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 client = AsyncIOMotorClient(MONGO_URI)
 db = client["neurocore_db"]
 
-# Коллекции MongoDB
 users_collection = db["users"]
 chats_collection = db["chats"]
 
-# Конфигурация тарифов и моделей Gemini / Nano Banana
 TIERS = {
     "free": {
         "text_limit": 40,
         "photo_limit": 3,
         "draw_limit": 1,
-        "genai_model": "gemini-3.5-flash",
+        "genai_model": "gemini-2.0-flash",
         "model_name": "NCO 2.1 (Free)"
     },
     "pro": {
         "text_limit": 100,
         "photo_limit": 30,
         "draw_limit": 10,
-        "genai_model": "gemini-3.7-flash",
+        "genai_model": "gemini-2.0-pro-exp-02-05",
         "model_name": "NCO 3.1 (PRO)"
     }
 }
 
-# --- РАБОТА С ПОЛЬЗОВАТЕЛЯМИ И ЛИМИТАМИ ---
-
 async def get_or_create_user(user_id: int, username: str = None) -> Dict[str, Any]:
-    """Получает данные пользователя или создает новую запись."""
     user = await users_collection.find_one({"user_id": user_id})
     now = time.time()
 
@@ -52,7 +46,6 @@ async def get_or_create_user(user_id: int, username: str = None) -> Dict[str, An
         }
         await users_collection.insert_one(user)
     else:
-        # Проверка истечения PRO подписки
         if user.get("tier") == "pro" and user.get("subscription_expires", 0) < now:
             await users_collection.update_one(
                 {"user_id": user_id},
@@ -60,7 +53,7 @@ async def get_or_create_user(user_id: int, username: str = None) -> Dict[str, An
             )
             user["tier"] = "free"
 
-        # Автоматический сброс суточных лимитов (каждые 24 часа)
+        # Автоматический сброс лимитов каждые 24 часа
         if now - user.get("last_reset", 0) > 86400:
             await users_collection.update_one(
                 {"user_id": user_id},
@@ -80,7 +73,6 @@ async def get_or_create_user(user_id: int, username: str = None) -> Dict[str, An
     return user
 
 async def check_and_increment_limit(user_id: int, limit_type: str) -> bool:
-    """Проверяет лимит пользователя и увеличивает счетчик при наличии доступных запросов."""
     user = await get_or_create_user(user_id)
     tier = user.get("tier", "free")
     tier_info = TIERS.get(tier, TIERS["free"])
@@ -107,7 +99,6 @@ async def check_and_increment_limit(user_id: int, limit_type: str) -> bool:
     return True
 
 async def activate_pro_subscription(user_id: int, months: int):
-    """Активирует или продлевает PRO подписку."""
     user = await get_or_create_user(user_id)
     now = time.time()
     current_expires = user.get("subscription_expires", 0)
@@ -127,10 +118,7 @@ async def activate_pro_subscription(user_id: int, months: int):
         }
     )
 
-# --- РАБОТА С КОМНАТАМИ И ДИАЛОГАМИ ---
-
 async def create_new_chat(user_id: int, first_message: str) -> str:
-    """Создает новый диалог и устанавливает его как активный."""
     title = first_message[:30] + "..." if len(first_message) > 30 else first_message
     chat_data = {
         "user_id": user_id,
@@ -148,14 +136,12 @@ async def create_new_chat(user_id: int, first_message: str) -> str:
     return chat_id
 
 async def set_current_chat(user_id: int, chat_id: Optional[str]):
-    """Переключает активный диалог у пользователя."""
     await users_collection.update_one(
         {"user_id": user_id},
         {"$set": {"current_chat_id": chat_id}}
     )
 
 async def add_message_to_chat(chat_id: str, role: str, content: str):
-    """Добавляет сообщение в историю комнаты."""
     try:
         await chats_collection.update_one(
             {"_id": ObjectId(chat_id)},
@@ -164,18 +150,16 @@ async def add_message_to_chat(chat_id: str, role: str, content: str):
     except Exception:
         pass
 
-async def get_chat_history(chat_id: str) -> List[Dict[str, str]]:
-    """Возвращает сообщения из выбранной комнаты."""
+async def get_chat_history(chat_id: str, limit: int = 10) -> List[Dict[str, str]]:
     try:
         chat = await chats_collection.find_one({"_id": ObjectId(chat_id)})
-        if chat:
-            return chat.get("messages", [])
+        if chat and "messages" in chat:
+            return chat["messages"][-limit:]
     except Exception:
         pass
     return []
 
 async def get_user_recent_chats(user_id: int, limit: int = 10) -> List[Dict[str, Any]]:
-    """Возвращает список недавних диалогов пользователя."""
     cursor = chats_collection.find({"user_id": user_id}).sort("created_at", -1).limit(limit)
     chats = []
     async for doc in cursor:
@@ -185,4 +169,3 @@ async def get_user_recent_chats(user_id: int, limit: int = 10) -> List[Dict[str,
             "created_at": doc.get("created_at")
         })
     return chats
-    
