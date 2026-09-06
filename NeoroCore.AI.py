@@ -1,835 +1,674 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-=======================================================================================
-  TELEGRAM-БОТ НА AIOGRAM 3.x С ИНТЕГРАЦИЕЙ GOOGLE GEMINI (google-genai SDK)
-=======================================================================================
+===========================================================================
+  NeuroCore Omega | AI — Telegram-бот на aiogram 3.x + aiohttp + google-genai
+===========================================================================
 
-Архитектура файла (сверху вниз):
-    1. Импорты и настройка логирования.
-    2. Загрузка и проверка переменных окружения (без них бот не имеет смысла запускать).
-    3. Константы: системный промпт, лимиты памяти, тексты кнопок, названия моделей.
-    4. Инициализация клиента Google GenAI.
-    5. Reply-клавиатура ровно с двумя кнопками (без «Новый чат» / «Недавние чаты»).
-    6. Хранилище сессий пользователей (in-memory, с автоочисткой старых сообщений).
-    7. Вспомогательные функции: работа с историей, скачивание фото, вызов Gemini,
-       генерация изображений с fallback-цепочкой.
-    8. Хэндлеры aiogram: /start, обработка двух кнопок, обработка фото, обработка текста.
-    9. Мини aiohttp-сервер (health-check для Render / UptimeRobot и т.п.).
-   10. Точка входа: параллельный запуск aiohttp-сервера и long-polling бота,
-       с отказоустойчивым перезапуском при падении.
+Что внутри:
+  - Текст и зрение: модели Gemini 3.5 Flash (Free) и Gemini 3.7 Flash (Pro).
+  - Генерация картинок: Gemini 3.1 Flash Image ("NeuroCore Vision 1.5"),
+    с автопереключением на облегчённую модель при сбое.
+  - Лимиты на 24 часа: Free — 30 сообщений / 3 фото / 1 генерация,
+    Pro — 100 сообщений / 30 фото / 10 генераций.
+  - Оплата PRO через Telegram Stars (валюта XTR) на 1/3/6/12/24 месяца.
+  - Хранение лимитов и подписки в MongoDB (переживает рестарт/сон Render).
+    Если MONGO_URI не задан — работает на памяти процесса (для теста).
+  - aiohttp health-check сервер (обязателен для Render Web Service).
 
-Все комментарии — на русском языке, максимально подробные, чтобы код можно было
-использовать как учебный пример и как production-заготовку одновременно.
-=======================================================================================
+ВАЖНО про переменные окружения на Render:
+  TELEGRAM_TOKEN   — токен бота (поддерживается и старое имя TELEGRAM_BOT_TOKEN)
+  GEMINI_API_KEY   — ключ Google GenAI
+  MONGO_URI        — строка подключения MongoDB (опционально, но настоятельно рекомендуется)
+  PORT             — порт для health-check (Render подставляет сам)
+===========================================================================
 """
 
-# ---------------------------------------------------------------------------------
-# БЛОК 1. ИМПОРТЫ
-# ---------------------------------------------------------------------------------
+import os
+import sys
+import time
+import asyncio
+import logging
+import traceback
+from collections import defaultdict, deque
+from typing import Optional, Dict, Any, List, Tuple
 
-import os                      # Работа с переменными окружения
-import sys                     # Для корректного завершения процесса при фатальных ошибках
-import asyncio                 # Асинхронный цикл событий — основа aiogram и aiohttp
-import logging                 # Подробное логирование всех этапов работы бота
-import io                      # Работа с байтовыми потоками (для фото и картинок)
-import time                    # Метки времени для логов и троттлинга
-import traceback               # Полный трейсбек ошибок в логах при отладке
-from collections import defaultdict, deque   # Эффективное хранилище истории диалога
-from dataclasses import dataclass, field     # Удобные структуры данных для сессий
-from typing import Optional, List, Dict, Any
-
-from aiohttp import web        # Веб-сервер для health-check (обязателен для Render)
-import aiohttp                 # Асинхронные HTTP-запросы (например, скачивание файла из Telegram)
+from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ChatAction
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
-    Message,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-    BufferedInputFile,
+    Message, ReplyKeyboardMarkup, KeyboardButton, BufferedInputFile,
+    InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery,
+    LabeledPrice, PreCheckoutQuery,
 )
 from aiogram.exceptions import TelegramAPIError
 
-# Google GenAI SDK — официальный клиент для Gemini (текст, зрение, генерация картинок)
 from google import genai
 from google.genai import types as genai_types
 from google.genai.errors import APIError as GenAIAPIError
 
-
 # ---------------------------------------------------------------------------------
-# БЛОК 2. НАСТРОЙКА ЛОГИРОВАНИЯ
+# ЛОГИРОВАНИЕ
 # ---------------------------------------------------------------------------------
-# Логи пишем и в консоль (для Render/Docker-логов), формат — с меткой времени,
-# уровнем важности и именем модуля, чтобы легко искать проблему по логам.
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-
-# Приглушаем излишне «болтливые» логи сторонних библиотек, оставляя только warning+
 logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
-
-logger = logging.getLogger("gemini_bot")
-
+logger = logging.getLogger("neurocore_omega")
 
 # ---------------------------------------------------------------------------------
-# БЛОК 3. ПРОВЕРКА ПЕРЕМЕННЫХ ОКРУЖЕНИЯ
+# ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
 # ---------------------------------------------------------------------------------
-# Бот не должен «тихо» падать при первом обращении пользователя из-за отсутствия
-# токена — все обязательные переменные проверяются ДО запуска event loop.
+# Токен бота ищем сразу под двумя именами — это защищает от ситуации, когда
+# на Render переменная называется иначе, чем ожидает код (частая причина
+# падений при деплое: "Exited with status 1" из-за несовпадения имени).
+TELEGRAM_TOKEN: Optional[str] = os.environ.get("TELEGRAM_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN")
+GEMINI_API_KEY: Optional[str] = os.environ.get("GEMINI_API_KEY")
+MONGO_URI: Optional[str] = os.environ.get("MONGO_URI")  # опционально
+PORT: int = int(os.environ.get("PORT", "10000"))
 
-def get_env_or_die(name: str, secret: bool = True) -> str:
-    """
-    Читает переменную окружения. Если она не задана — логирует критическую ошибку
-    и завершает процесс с ненулевым кодом (это остановит контейнер/деплой и даст
-    понятный сигнал в логах Render, а не непонятный traceback где-то в middleware).
-
-    :param name: имя переменной окружения
-    :param secret: если True — значение не будет напечатано в логах целиком
-    """
-    value = os.environ.get(name)
-    if not value:
-        logger.critical("Переменная окружения '%s' не задана! Завершение работы.", name)
-        sys.exit(1)
-    if secret:
-        logger.info("Переменная окружения '%s' успешно загружена (значение скрыто).", name)
-    else:
-        logger.info("Переменная окружения '%s' = %s", name, value)
-    return value
-
-
-def get_env_optional(name: str, default: str) -> str:
-    """Читает необязательную переменную окружения с дефолтным значением."""
-    value = os.environ.get(name, default)
-    logger.info("Переменная окружения '%s' = %s (значение по умолчанию, если не задано отдельно)", name, value)
-    return value
-
-
-# Обязательные переменные — без них бот бессмысленен
-TELEGRAM_BOT_TOKEN: str = get_env_or_die("TELEGRAM_BOT_TOKEN")
-GEMINI_API_KEY: str = get_env_or_die("GEMINI_API_KEY")
-
-# Необязательные переменные с разумными значениями по умолчанию
-PORT: int = int(get_env_optional("PORT", "10000"))           # Render пробрасывает свой PORT
-TEXT_MODEL_NAME: str = get_env_optional("TEXT_MODEL_NAME", "gemini-2.5-flash")
-VISION_MODEL_NAME: str = get_env_optional("VISION_MODEL_NAME", "gemini-2.5-flash")
-IMAGE_MODEL_PRIMARY: str = get_env_optional("IMAGE_MODEL_PRIMARY", "gemini-2.5-flash-image")
-IMAGE_MODEL_FALLBACK: str = get_env_optional("IMAGE_MODEL_FALLBACK", "imagen-3.0-generate-002")
-PRO_LINK: str = get_env_optional("PRO_SUBSCRIPTION_URL", "https://t.me/your_payment_bot")
-
+if not TELEGRAM_TOKEN:
+    logger.critical("Не найден токен бота. Задайте TELEGRAM_TOKEN (или TELEGRAM_BOT_TOKEN) в Environment Variables на Render.")
+    sys.exit(1)
+if not GEMINI_API_KEY:
+    logger.critical("Не найден GEMINI_API_KEY. Задайте его в Environment Variables на Render.")
+    sys.exit(1)
+if not MONGO_URI:
+    logger.warning("MONGO_URI не задан — лимиты и PRO-подписки будут храниться только в памяти процесса "
+                    "и обнулятся при перезапуске/засыпании инстанса на Render. Рекомендуется подключить MongoDB.")
 
 # ---------------------------------------------------------------------------------
-# БЛОК 4. КОНСТАНТЫ И СИСТЕМНЫЙ ПРОМПТ
+# БРЕНДИНГ И МОДЕЛИ
 # ---------------------------------------------------------------------------------
+BOT_BRAND_NAME = "NeuroCore Omega | AI"
+FREE_MODEL_BRAND = "NeuroCore Omega 2.4 Free"
+PRO_MODEL_BRAND = "NeuroCore Omega 3.1 Pro"
+VISION_MODEL_BRAND = "NeuroCore Vision 1.5"
 
-# Максимальное количество РЕПЛИК (не токенов!), которое хранится в истории одного
-# пользователя. Каждая реплика — это один словарь {"role": ..., "parts": [...]}.
-# Ограничение через deque(maxlen=...) исключает бесконечный рост памяти процесса.
-MAX_HISTORY_MESSAGES: int = 20
+# Реальные ID моделей Gemini, которые стоят за брендами (актуальны на момент написания).
+TEXT_MODEL_BY_TIER = {
+    "free": "gemini-3.5-flash",
+    "pro": "gemini-3.7-flash",
+}
+IMAGE_MODEL_PRIMARY = "gemini-3.1-flash-image"       # основная модель генерации картинок
+IMAGE_MODEL_FALLBACK = "gemini-3.1-flash-lite-image"  # облегчённый резерв при сбое основной
 
-# Сколько последних реплик реально отправляем модели в каждом запросе.
-# Иногда есть смысл хранить чуть больше, чем отправляем — но здесь для простоты
-# и предсказуемости расхода токенов используем то же самое окно.
-MESSAGES_TO_SEND: int = 20
+# ---------------------------------------------------------------------------------
+# ЛИМИТЫ (окно — 24 часа, обнуляется автоматически)
+# ---------------------------------------------------------------------------------
+WINDOW_SECONDS = 24 * 60 * 60
+LIMITS = {
+    "free": {"messages": 30, "photos": 3, "images": 1},
+    "pro": {"messages": 100, "photos": 30, "images": 10},
+}
 
-# Максимальный размер фотографии, которую мы скачиваем и отправляем в Gemini (байт).
-# Защита от чрезмерно тяжёлых файлов и лишнего расхода трафика/токенов.
-MAX_PHOTO_SIZE_BYTES: int = 15 * 1024 * 1024  # 15 МБ
+# ---------------------------------------------------------------------------------
+# ТАРИФНЫЕ ПЛАНЫ PRO (Telegram Stars, валюта XTR)
+# ---------------------------------------------------------------------------------
+# Формат: (месяцы, цена в звёздах, подпись)
+# Цены заданы со скидкой за более длинный срок — при необходимости легко поменять.
+PRO_PLANS: List[Tuple[int, int, str]] = [
+    (1, 25, "1 месяц — 25 ⭐"),
+    (3, 65, "3 месяца — 65 ⭐"),
+    (6, 120, "6 месяцев — 120 ⭐"),
+    (12, 220, "12 месяцев — 220 ⭐"),
+    (24, 400, "24 месяца — 400 ⭐"),
+]
 
-# Тексты двух единственных кнопок интерфейса. Намеренно НЕТ кнопок
-# «Новый чат» / «Недавние чаты» — по требованиям интерфейса бот держится
-# максимально «чистым» и не перегружает пользователя лишними опциями.
-BTN_PRO_SUBSCRIPTION = "⭐ PRO Подписка"
-BTN_GENERATE_ART = "🎨 Сгенерировать арт"
-
-# Системный промпт — «характер» бота. Задаёт стиль общения (тепло, уважительно,
-# обращение на «Вы» с постепенным переходом на «ты», если пользователь сам
-# переходит на неформальное общение), а также экспертизу в программировании.
-SYSTEM_PROMPT: str = """
-Ты — дружелюбный, тёплый и очень компетентный ИИ-ассистент в Telegram.
+# ---------------------------------------------------------------------------------
+# СИСТЕМНЫЙ ПРОМПТ
+# ---------------------------------------------------------------------------------
+def build_system_prompt(tier: str) -> str:
+    """Собирает системный промпт с учётом текущего тарифа пользователя."""
+    model_brand = PRO_MODEL_BRAND if tier == "pro" else FREE_MODEL_BRAND
+    return f"""
+Тебя зовут {BOT_BRAND_NAME}, ты работаешь в режиме "{model_brand}".
+Если тебя спрашивают, какая ты модель или кто тебя создал — называй только своё имя
+и режим ({model_brand}), никогда не упоминай Gemini, Google или другие компании-разработчики.
 
 СТИЛЬ ОБЩЕНИЯ:
-- В начале диалога и с новыми пользователями обращайся на «Вы» — уважительно, но без излишней
-  официозности и канцелярита. Никаких сухих шаблонных фраз вроде «Здравствуйте, чем могу быть полезен».
-- Если пользователь сам переходит на «ты», естественно и без объявлений подстраивайся под его тон
-  и тоже общайся на «ты» — тепло, по-дружески, как хороший знакомый, но сохраняя уважение.
-- Пиши живо, без канцеляризмов, избегай шаблонных вводных фраз. Проявляй эмпатию, если пользователь
-  делится проблемой или трудностью — сначала прояви понимание, потом переходи к сути.
-- Будь честен: если чего-то не знаешь или не уверен — так и скажи, не выдумывай факты.
-- Не используй чрезмерное количество эмодзи — один-два уместных эмодзи на сообщение, не больше,
-  и только там, где это действительно усиливает тон, а не превращает ответ в набор смайликов.
+- Обращайся на «Вы», уважительно, но тепло и живо, без канцелярита.
+- Если пользователь сам переходит на «ты» — естественно подстраивайся и общайся на «ты».
+- Проявляй эмпатию, если пользователь делится проблемой. Не выдумывай факты, если не уверена(-ен).
+- Используй эмодзи умеренно — один-два на сообщение, только там, где это уместно.
 
-ЭКСПЕРТИЗА В ПРОГРАММИРОВАНИИ:
-- Ты пишешь безупречный, идиоматичный код на любых языках программирования: Python, JavaScript/
-  TypeScript, Go, Rust, C/C++, C#, Java, Kotlin, Swift, PHP, Ruby, SQL, Bash и других — по запросу.
-- Код всегда оформляй в блоках ```язык ... ```, с содержательными комментариями там, где это
-  улучшает читаемость, но без избыточности.
-- Предлагай рабочие, протестированные мысленно решения, указывай на потенциальные подводные камни
-  (эффективность, безопасность, edge-cases), если они есть.
-- Если задача сформулирована нечётко — сначала уточни детали, а не гадай наугад, если это критично
-  для правильности решения; если можно сделать разумное предположение — сделай его и явно озвучь.
+ЭКСПЕРТИЗА В КОДЕ:
+- Пишешь идиоматичный, рабочий код на любом языке программирования по запросу.
+- Код оформляй в блоках ```язык ... ``` с содержательными комментариями.
+- Указывай на подводные камни (эффективность, безопасность, edge-cases), если они есть.
 
-ОБЩИЕ ПРИНЦИПЫ:
-- Отвечай по существу, избегай воды.
-- Форматируй ответы с помощью Markdown (Telegram поддерживает разметку) там, где это уместно:
-  списки, жирный текст для акцентов, блоки кода.
-- Ты умеешь анализировать изображения, которые присылает пользователь: описывать содержимое,
-  распознавать текст, объяснять диаграммы, помогать с код-ревью по скриншотам кода и т.д.
+Отвечай по существу, используй Markdown-разметку Telegram (жирный текст, списки, код) там, где уместно.
+Ты умеешь анализировать присланные изображения: описывать содержимое, читать текст, разбирать код на скриншотах.
 """.strip()
 
 
 # ---------------------------------------------------------------------------------
-# БЛОК 5. ИНИЦИАЛИЗАЦИЯ КЛИЕНТА GOOGLE GENAI
+# ИНИЦИАЛИЗАЦИЯ GOOGLE GENAI
 # ---------------------------------------------------------------------------------
-# Клиент создаётся один раз на весь процесс — это самый эффективный вариант,
-# т.к. внутри используется пул HTTP-соединений.
-
 try:
     genai_client = genai.Client(api_key=GEMINI_API_KEY)
-    logger.info("Клиент Google GenAI успешно инициализирован.")
-except Exception as exc:  # noqa: BLE001 — на этапе инициализации ловим максимально широко
-    logger.critical("Не удалось инициализировать клиент Google GenAI: %s", exc)
+    logger.info("Клиент Google GenAI инициализирован.")
+except Exception as exc:
+    logger.critical("Не удалось инициализировать Google GenAI: %s", exc)
     sys.exit(1)
 
 
 # ---------------------------------------------------------------------------------
-# БЛОК 6. REPLY-КЛАВИАТУРА (ТОЛЬКО ДВЕ КНОПКИ)
+# ХРАНИЛИЩЕ: MongoDB (если есть MONGO_URI) либо память процесса (fallback)
 # ---------------------------------------------------------------------------------
-
-def build_main_keyboard() -> ReplyKeyboardMarkup:
+class Storage:
     """
-    Строит главную (и единственную) reply-клавиатуру бота.
-
-    Важно: по требованиям интерфейса здесь ровно ДВЕ кнопки, никаких дополнительных
-    рядов вроде «Новый чат» или «Недавние чаты» — интерфейс должен оставаться
-    предельно простым и не отвлекать пользователя от диалога.
+    Унифицированное хранилище лимитов и PRO-подписки пользователя.
+    Работает поверх MongoDB (через motor) либо, если MONGO_URI не задан,
+    поверх обычного словаря в памяти — так бота можно тестировать локально
+    без базы данных, но в проде MongoDB обязательна для сохранности данных
+    между перезапусками/засыпаниями инстанса на Render.
     """
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text=BTN_PRO_SUBSCRIPTION), KeyboardButton(text=BTN_GENERATE_ART)],
-        ],
-        resize_keyboard=True,       # Клавиатура компактно подстраивается под размер кнопок
-        is_persistent=True,         # Клавиатура не сворачивается сама по себе
-        input_field_placeholder="Напишите сообщение или выберите действие…",
-    )
+
+    def __init__(self, mongo_uri: Optional[str]):
+        self._memory: Dict[int, Dict[str, Any]] = {}
+        self._collection = None
+        if mongo_uri:
+            try:
+                from motor.motor_asyncio import AsyncIOMotorClient
+                client = AsyncIOMotorClient(mongo_uri)
+                self._collection = client["neurocore_omega"]["users"]
+                logger.info("Подключение к MongoDB установлено, лимиты будут сохраняться постоянно.")
+            except Exception as exc:
+                logger.error("Не удалось подключиться к MongoDB (%s), переключаюсь на память процесса.", exc)
+                self._collection = None
+
+    @staticmethod
+    def _default_doc(user_id: int) -> Dict[str, Any]:
+        return {
+            "user_id": user_id,
+            "is_pro": False,
+            "pro_expires_at": None,      # unix-время окончания подписки
+            "window_start": time.time(),
+            "messages_used": 0,
+            "photos_used": 0,
+            "images_used": 0,
+        }
+
+    async def get_user(self, user_id: int) -> Dict[str, Any]:
+        if self._collection is not None:
+            doc = await self._collection.find_one({"user_id": user_id})
+            if doc is None:
+                doc = self._default_doc(user_id)
+                await self._collection.insert_one(dict(doc))
+            return doc
+        return self._memory.setdefault(user_id, self._default_doc(user_id))
+
+    async def update_user(self, user_id: int, updates: Dict[str, Any]) -> None:
+        if self._collection is not None:
+            await self._collection.update_one({"user_id": user_id}, {"$set": updates}, upsert=True)
+        else:
+            self._memory.setdefault(user_id, self._default_doc(user_id)).update(updates)
 
 
-MAIN_KEYBOARD = build_main_keyboard()
-
-
-# ---------------------------------------------------------------------------------
-# БЛОК 7. МОДЕЛЬ ДАННЫХ СЕССИИ И ХРАНИЛИЩЕ ПАМЯТИ
-# ---------------------------------------------------------------------------------
-
-@dataclass
-class UserSession:
-    """
-    Хранит состояние диалога одного пользователя.
-
-    history — это deque (двусторонняя очередь) с ограничением maxlen. Как только
-    в неё добавляется элемент сверх лимита, самый старый элемент автоматически
-    вытесняется. Это даёт нам «оптимизированное управление памятью» без ручного
-    среза списков на каждой итерации — операция O(1) вместо O(n) при list.pop(0).
-
-    Каждый элемент истории — словарь в формате, ожидаемом Gemini API:
-        {"role": "user" | "model", "parts": [genai_types.Part, ...]}
-
-    awaiting_art_prompt — флаг, показывающий, что пользователь нажал кнопку
-    «Сгенерировать арт» и следующее его текстовое сообщение нужно интерпретировать
-    как промпт для генерации изображения, а не как обычную реплику чата.
-
-    last_activity_ts — метка времени последнего сообщения, используется, например,
-    для потенциальной будущей очистки неактивных сессий по TTL (задел на будущее).
-    """
-    history: deque = field(default_factory=lambda: deque(maxlen=MAX_HISTORY_MESSAGES))
-    awaiting_art_prompt: bool = False
-    last_activity_ts: float = field(default_factory=time.time)
-
-
-# Глобальное in-memory хранилище сессий: ключ — telegram user_id, значение — UserSession.
-# defaultdict автоматически создаёт новую пустую сессию при первом обращении к user_id,
-# что избавляет от повторяющихся проверок "if user_id not in sessions: ...".
-USER_SESSIONS: Dict[int, UserSession] = defaultdict(UserSession)
-
-
-def get_session(user_id: int) -> UserSession:
-    """Возвращает сессию пользователя, обновляя метку последней активности."""
-    session = USER_SESSIONS[user_id]
-    session.last_activity_ts = time.time()
-    return session
-
-
-def append_to_history(session: UserSession, role: str, parts: List[Any]) -> None:
-    """
-    Добавляет новую реплику в историю сессии.
-
-    Благодаря deque(maxlen=MAX_HISTORY_MESSAGES) старые сообщения вытесняются
-    автоматически — отдельный код для «среза» истории не требуется, но ниже
-    оставлена явная защитная функция trim_history() на случай, если история
-    когда-либо будет храниться в обычном списке (например, при миграции на Redis).
-    """
-    session.history.append({"role": role, "parts": parts})
-
-
-def trim_history(session: UserSession) -> None:
-    """
-    Явный «защитный» срез истории по последним MESSAGES_TO_SEND сообщениям.
-
-    Хотя deque уже ограничивает размер истории через maxlen, эта функция
-    дополнительно подстраховывает нас на случай, если MESSAGES_TO_SEND задан
-    меньше, чем MAX_HISTORY_MESSAGES (то есть мы храним больше, чем отправляем
-    в модель за раз — полезно, если в будущем понадобится суммаризация «хвоста»
-    истории вместо простого отбрасывания).
-    """
-    if len(session.history) > MESSAGES_TO_SEND:
-        trimmed = list(session.history)[-MESSAGES_TO_SEND:]
-        session.history = deque(trimmed, maxlen=MAX_HISTORY_MESSAGES)
+storage = Storage(MONGO_URI)
 
 
 # ---------------------------------------------------------------------------------
-# БЛОК 8. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ РАБОТЫ С GEMINI (ТЕКСТ + ЗРЕНИЕ)
+# БИЗНЕС-ЛОГИКА: ТАРИФ, ЛИМИТЫ, ОКНО 24 ЧАСА
 # ---------------------------------------------------------------------------------
+def effective_tier(user: Dict[str, Any]) -> str:
+    """Возвращает 'pro', если подписка активна и не истекла, иначе 'free'."""
+    if user.get("is_pro") and user.get("pro_expires_at") and user["pro_expires_at"] > time.time():
+        return "pro"
+    return "free"
 
+
+async def ensure_fresh_window(user_id: int, user: Dict[str, Any]) -> Dict[str, Any]:
+    """Если с начала окна прошло 24 часа — обнуляет счётчики использования."""
+    now = time.time()
+    if now - user.get("window_start", 0) >= WINDOW_SECONDS:
+        updates = {"window_start": now, "messages_used": 0, "photos_used": 0, "images_used": 0}
+        user.update(updates)
+        await storage.update_user(user_id, updates)
+    return user
+
+
+def time_left_str(user: Dict[str, Any]) -> str:
+    """Человекочитаемое время до сброса лимита."""
+    remaining = max(0.0, WINDOW_SECONDS - (time.time() - user.get("window_start", time.time())))
+    hours, minutes = int(remaining // 3600), int((remaining % 3600) // 60)
+    return f"{hours} ч {minutes} мин"
+
+
+async def try_consume(user_id: int, kind: str) -> Tuple[bool, Dict[str, Any], str]:
+    """
+    Пытается "потратить" одну единицу лимита (kind: messages/photos/images).
+    Возвращает (разрешено?, актуальный документ пользователя, текущий тариф).
+    Если подписка PRO истекла — автоматически понижает пользователя до Free.
+    """
+    user = await storage.get_user(user_id)
+    user = await ensure_fresh_window(user_id, user)
+
+    tier = effective_tier(user)
+    if user.get("is_pro") and tier == "free":
+        await storage.update_user(user_id, {"is_pro": False})
+        user["is_pro"] = False
+
+    limit = LIMITS[tier][kind]
+    used_field = f"{kind}_used"
+    used = user.get(used_field, 0)
+
+    if used >= limit:
+        return False, user, tier
+
+    used += 1
+    await storage.update_user(user_id, {used_field: used})
+    user[used_field] = used
+    return True, user, tier
+
+
+async def activate_pro(user_id: int, months: int) -> float:
+    """
+    Активирует/продлевает PRO-подписку на заданное число месяцев.
+    Если подписка уже активна — продлевает от текущей даты окончания,
+    иначе — от текущего момента. Возвращает unix-время новой даты окончания.
+    """
+    user = await storage.get_user(user_id)
+    now = time.time()
+    base = user["pro_expires_at"] if (user.get("is_pro") and user.get("pro_expires_at", 0) > now) else now
+    new_expiry = base + months * 30 * 24 * 60 * 60  # месяц считаем как 30 суток
+    await storage.update_user(user_id, {"is_pro": True, "pro_expires_at": new_expiry})
+    return new_expiry
+
+
+# ---------------------------------------------------------------------------------
+# КЛАВИАТУРЫ
+# ---------------------------------------------------------------------------------
+BTN_PRO = "⭐ PRO Подписка"
+BTN_ART = "🎨 Сгенерировать арт"
+
+MAIN_KEYBOARD = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text=BTN_PRO), KeyboardButton(text=BTN_ART)]],
+    resize_keyboard=True,
+    is_persistent=True,
+    input_field_placeholder="Напишите сообщение или выберите действие…",
+)
+
+
+def build_pro_plans_keyboard() -> InlineKeyboardMarkup:
+    """Инлайн-клавиатура выбора срока PRO-подписки (данные берутся из PRO_PLANS)."""
+    rows = [
+        [InlineKeyboardButton(text=label, callback_data=f"buy_pro:{months}")]
+        for months, _stars, label in PRO_PLANS
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# ---------------------------------------------------------------------------------
+# ПАМЯТЬ ДИАЛОГА (история чата — только в оперативной памяти, без Mongo)
+# ---------------------------------------------------------------------------------
+MAX_HISTORY_MESSAGES = 20
+HISTORY: Dict[int, deque] = defaultdict(lambda: deque(maxlen=MAX_HISTORY_MESSAGES))
+AWAITING_ART: Dict[int, bool] = defaultdict(bool)
+
+
+# ---------------------------------------------------------------------------------
+# ВЗАИМОДЕЙСТВИЕ С GEMINI
+# ---------------------------------------------------------------------------------
 async def download_photo_bytes(bot: Bot, file_id: str) -> Optional[bytes]:
-    """
-    Скачивает файл фотографии из Telegram по file_id и возвращает его байты.
-
-    Используем bot.get_file() для получения file_path, затем bot.download_file()
-    для скачивания самого содержимого. Ограничиваем размер файла, чтобы не
-    расходовать лишний трафик и не упереться в лимиты Gemini API по размеру
-    вложения.
-
-    :return: байты изображения либо None при ошибке/превышении лимита размера.
-    """
+    """Скачивает фото из Telegram по file_id. Возвращает None при ошибке."""
     try:
         file_info = await bot.get_file(file_id)
-
-        if file_info.file_size and file_info.file_size > MAX_PHOTO_SIZE_BYTES:
-            logger.warning(
-                "Файл %s превышает лимит размера (%d байт > %d байт), пропускаем.",
-                file_id, file_info.file_size, MAX_PHOTO_SIZE_BYTES,
-            )
-            return None
-
-        file_stream: io.BytesIO = await bot.download_file(file_info.file_path)
-        return file_stream.read()
-
-    except TelegramAPIError as exc:
-        logger.error("Ошибка Telegram API при скачивании файла %s: %s", file_id, exc)
-        return None
-    except Exception as exc:  # noqa: BLE001 — сетевые сбои тоже перехватываем здесь
-        logger.error("Непредвиденная ошибка при скачивании файла %s: %s", file_id, exc)
+        stream = await bot.download_file(file_info.file_path)
+        return stream.read()
+    except (TelegramAPIError, Exception) as exc:  # noqa: BLE001
+        logger.error("Ошибка скачивания фото %s: %s", file_id, exc)
         return None
 
 
-def build_contents_for_gemini(session: UserSession) -> List[Dict[str, Any]]:
-    """
-    Формирует список contents для передачи в generate_content на основе истории
-    сессии, предварительно применив «срез по последним сообщениям».
-    """
-    trim_history(session)
-    return list(session.history)
-
-
-async def ask_gemini_text(
-    session: UserSession,
-    user_text: str,
-    image_bytes: Optional[bytes] = None,
-    image_mime_type: str = "image/jpeg",
+async def ask_gemini(
+    user_id: int, tier: str, user_text: str,
+    image_bytes: Optional[bytes] = None, image_mime_type: str = "image/jpeg",
 ) -> str:
     """
-    Основная функция обращения к текстовой/мультимодальной модели Gemini.
-
-    Логика:
-        1. Собираем "parts" нового сообщения пользователя: текст + (опционально) картинка.
-        2. Добавляем сообщение в историю сессии.
-        3. Формируем полный список contents (история + системный промпт передаётся
-           отдельно через config.system_instruction — это официальный механизм
-           google-genai для системных инструкций, не засоряющий историю диалога).
-        4. Вызываем generate_content в отдельном потоке через asyncio.to_thread,
-           т.к. официальный синхронный клиент genai блокирующий, а нам нужен
-           неблокирующий event loop aiogram.
-        5. Добавляем ответ модели в историю сессии.
-        6. Возвращаем текст ответа пользователю.
-
-    Обрабатываются любые исключения GenAI API — пользователь получает вежливое
-    сообщение об ошибке, а полная трассировка уходит в лог.
+    Отправляет сообщение (и опционально фото) в Gemini с учётом истории диалога
+    и системного промпта, соответствующего текущему тарифу пользователя.
     """
-    user_parts: List[Any] = []
+    history = HISTORY[user_id]
 
+    parts: List[Any] = []
     if image_bytes:
-        # Картинка передаётся как Part.from_bytes — стандартный способ мультимодального
-        # ввода в google-genai для «сырых» байтов без загрузки через Files API.
-        user_parts.append(
-            genai_types.Part.from_bytes(data=image_bytes, mime_type=image_mime_type)
-        )
+        parts.append(genai_types.Part.from_bytes(data=image_bytes, mime_type=image_mime_type))
+    text_for_model = user_text.strip() or "Опиши, что изображено на этой картинке."
+    parts.append(genai_types.Part.from_text(text=text_for_model))
 
-    # Текст добавляем всегда — даже пустую подпись к фото заменяем на нейтральный
-    # промпт, чтобы модель не осталась без текстовой части запроса.
-    text_for_model = user_text.strip() if user_text and user_text.strip() else (
-        "Опиши, что изображено на этой картинке, и прокомментируй её."
-    )
-    user_parts.append(genai_types.Part.from_text(text=text_for_model))
+    history.append({"role": "user", "parts": parts})
+    contents = list(history)
 
-    append_to_history(session, role="user", parts=user_parts)
-    contents = build_contents_for_gemini(session)
-
-    generation_config = genai_types.GenerateContentConfig(
-        system_instruction=SYSTEM_PROMPT,
-        temperature=0.8,             # Небольшая доля творчества, но без потери связности
-        max_output_tokens=4096,      # Достаточно для развёрнутых ответов и кода
-        top_p=0.95,
+    config = genai_types.GenerateContentConfig(
+        system_instruction=build_system_prompt(tier),
+        temperature=0.8,
+        max_output_tokens=4096,
     )
 
     try:
-        # Выбираем модель: если в запросе есть изображение — используем vision-модель
-        # (в данном случае это может быть та же модель, но параметр вынесен отдельно
-        # на случай, если понадобится разделить текстовую и визуальную модели).
-        model_name = VISION_MODEL_NAME if image_bytes else TEXT_MODEL_NAME
-
         response = await asyncio.to_thread(
             genai_client.models.generate_content,
-            model=model_name,
+            model=TEXT_MODEL_BY_TIER[tier],
             contents=contents,
-            config=generation_config,
+            config=config,
         )
-
-        answer_text = (response.text or "").strip()
-        if not answer_text:
-            answer_text = "Извините, не получилось сформировать ответ. Попробуйте переформулировать запрос."
-
-        # Ответ модели тоже кладём в историю — это критично для связности диалога.
-        append_to_history(
-            session,
-            role="model",
-            parts=[genai_types.Part.from_text(text=answer_text)],
-        )
-        return answer_text
-
+        answer = (response.text or "").strip() or "Не получилось сформировать ответ, попробуйте переформулировать запрос."
+        history.append({"role": "model", "parts": [genai_types.Part.from_text(text=answer)]})
+        return answer
     except GenAIAPIError as exc:
-        logger.error("Ошибка Gemini API (текст): %s", exc)
-        return (
-            "Сейчас возникли технические неполадки при обращении к модели. "
-            "Пожалуйста, попробуйте ещё раз через несколько секунд."
-        )
+        logger.error("Ошибка Gemini API: %s", exc)
+        return "Сейчас технические неполадки при обращении к модели. Попробуйте, пожалуйста, ещё раз через минуту."
     except Exception as exc:  # noqa: BLE001
-        logger.error("Непредвиденная ошибка в ask_gemini_text: %s\n%s", exc, traceback.format_exc())
-        return "Произошла непредвиденная ошибка. Мы уже разбираемся, попробуйте, пожалуйста, чуть позже."
+        logger.error("Непредвиденная ошибка ask_gemini: %s\n%s", exc, traceback.format_exc())
+        return "Произошла непредвиденная ошибка. Попробуйте, пожалуйста, чуть позже."
 
 
-# ---------------------------------------------------------------------------------
-# БЛОК 9. ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ С МЕХАНИЗМОМ FALLBACK
-# ---------------------------------------------------------------------------------
-
-async def _generate_image_with_model(prompt: str, model_name: str) -> Optional[bytes]:
-    """
-    Пытается сгенерировать изображение конкретной моделью.
-
-    Возвращает байты PNG/JPEG-изображения либо None, если модель не смогла
-    вернуть картинку (например, отфильтровала промпт или вернула только текст).
-
-    Функция не перехватывает исключения "тихо" — они пробрасываются наверх,
-    чтобы вызывающий код (generate_art_with_fallback) мог принять решение
-    о переключении на резервную модель.
-    """
+async def _generate_image(prompt: str, model_name: str) -> Optional[bytes]:
+    """Один вызов модели генерации изображений. Возвращает байты картинки либо None."""
     response = await asyncio.to_thread(
         genai_client.models.generate_content,
         model=model_name,
         contents=[genai_types.Part.from_text(text=prompt)],
-        config=genai_types.GenerateContentConfig(
-            response_modalities=["Image"],
-        ),
     )
-
     if not response.candidates:
         return None
-
     for part in response.candidates[0].content.parts:
         inline_data = getattr(part, "inline_data", None)
         if inline_data and inline_data.data:
             return inline_data.data
-
     return None
 
 
 async def generate_art_with_fallback(prompt: str) -> Optional[bytes]:
     """
-    Генерирует изображение по текстовому промпту с отказоустойчивым fallback:
-
-        1. Сначала пробуем основную модель IMAGE_MODEL_PRIMARY.
-        2. Если основная модель недоступна (сетевая ошибка, таймаут, 5xx, лимит
-           запросов) или вернула пустой результат — переключаемся на резервную
-           модель IMAGE_MODEL_FALLBACK.
-        3. Если и резервная модель не сработала — возвращаем None, а вызывающий
-           код сообщает пользователю понятную ошибку.
-
-    Такой каскад значительно повышает отказоустойчивость: временная недоступность
-    одной модели (например, из-за перегрузки дата-центра) не «валит» всю функцию
-    генерации арта для пользователей.
+    Генерирует изображение основной моделью (NeuroCore Vision 1.5),
+    при любом сбое — автоматически переключается на облегчённую резервную модель.
     """
-    # --- Попытка №1: основная модель -------------------------------------------------
     try:
         logger.info("Генерация изображения основной моделью '%s'…", IMAGE_MODEL_PRIMARY)
-        image_bytes = await _generate_image_with_model(prompt, IMAGE_MODEL_PRIMARY)
+        image_bytes = await _generate_image(prompt, IMAGE_MODEL_PRIMARY)
         if image_bytes:
-            logger.info("Изображение успешно сгенерировано основной моделью.")
             return image_bytes
-        logger.warning("Основная модель вернула пустой результат, переключаемся на резервную.")
-    except (GenAIAPIError, aiohttp.ClientError, asyncio.TimeoutError, ConnectionError) as exc:
-        logger.warning("Основная модель генерации изображений недоступна (%s), пробуем резервную.", exc)
+        logger.warning("Основная модель вернула пустой результат, пробуем резервную.")
     except Exception as exc:  # noqa: BLE001
-        logger.error("Неожиданная ошибка основной модели генерации: %s", exc)
+        logger.warning("Основная модель генерации недоступна (%s), пробуем резервную.", exc)
 
-    # --- Попытка №2: резервная (fallback) модель -------------------------------------
     try:
         logger.info("Генерация изображения резервной моделью '%s'…", IMAGE_MODEL_FALLBACK)
-        image_bytes = await _generate_image_with_model(prompt, IMAGE_MODEL_FALLBACK)
-        if image_bytes:
-            logger.info("Изображение успешно сгенерировано резервной моделью.")
-            return image_bytes
-        logger.error("Резервная модель также вернула пустой результат.")
-        return None
+        return await _generate_image(prompt, IMAGE_MODEL_FALLBACK)
     except Exception as exc:  # noqa: BLE001
-        logger.error("Резервная модель генерации изображений тоже не сработала: %s", exc)
+        logger.error("Резервная модель тоже не сработала: %s", exc)
         return None
 
 
 # ---------------------------------------------------------------------------------
-# БЛОК 10. РОУТЕР И ХЭНДЛЕРЫ AIOGRAM
+# ХЭНДЛЕРЫ AIOGRAM
 # ---------------------------------------------------------------------------------
-
 router = Router(name="main_router")
 
 
 @router.message(CommandStart())
 async def handle_start(message: Message) -> None:
-    """
-    Хэндлер команды /start.
-
-    Приветствует пользователя тепло и уважительно (на «Вы»), сбрасывает его
-    сессию (новая история диалога с чистого листа) и показывает главную
-    клавиатуру ровно с двумя кнопками.
-    """
-    user_id = message.from_user.id if message.from_user else message.chat.id
-    USER_SESSIONS[user_id] = UserSession()  # свежая сессия при явном /start
-
-    first_name = message.from_user.first_name if message.from_user else "друг"
-
-    welcome_text = (
-        f"Здравствуйте, {first_name}! Рад(а) знакомству. 🙂\n\n"
-        "Я — Ваш персональный ИИ-ассистент: помогу разобраться в любом вопросе, "
-        "написать и отладить код на любом языке программирования, разобрать "
-        "изображение или скриншот, а по запросу — сгенерирую уникальную картинку.\n\n"
-        "Просто напишите сообщение — и мы начнём. Если захотите, можем перейти на «ты» "
-        "в любой момент разговора."
+    user_id = message.from_user.id
+    HISTORY.pop(user_id, None)
+    AWAITING_ART[user_id] = False
+    name = message.from_user.first_name or "друг"
+    await message.answer(
+        f"Здравствуйте, {name}! Я — {BOT_BRAND_NAME}. 🙂\n\n"
+        "Помогу разобраться в вопросе, написать и отладить код на любом языке, "
+        "разобрать изображение, а по запросу — сгенерирую картинку.\n\n"
+        "Пишите сообщение, и мы начнём. Если захотите — можем перейти на «ты» в любой момент.",
+        reply_markup=MAIN_KEYBOARD,
     )
-
-    await message.answer(welcome_text, reply_markup=MAIN_KEYBOARD)
-    logger.info("Пользователь %s (%s) запустил бота командой /start.", user_id, first_name)
 
 
 @router.message(Command("reset"))
 async def handle_reset(message: Message) -> None:
-    """
-    Дополнительная служебная команда для явного сброса истории диалога
-    (не обязательна к использованию пользователем, но полезна для отладки
-    и как «аварийный выход», если история засорилась нерелевантным контекстом).
-    """
-    user_id = message.from_user.id if message.from_user else message.chat.id
-    USER_SESSIONS[user_id] = UserSession()
-    await message.answer("История диалога очищена, можем начать заново.", reply_markup=MAIN_KEYBOARD)
+    HISTORY.pop(message.from_user.id, None)
+    await message.answer("История диалога очищена.", reply_markup=MAIN_KEYBOARD)
 
 
-@router.message(F.text == BTN_PRO_SUBSCRIPTION)
-async def handle_pro_subscription(message: Message) -> None:
-    """
-    Обрабатывает нажатие кнопки «⭐ PRO Подписка».
+@router.message(Command("status"))
+async def handle_status(message: Message) -> None:
+    user_id = message.from_user.id
+    user = await storage.get_user(user_id)
+    user = await ensure_fresh_window(user_id, user)
+    tier = effective_tier(user)
+    lim = LIMITS[tier]
+    brand = PRO_MODEL_BRAND if tier == "pro" else FREE_MODEL_BRAND
 
-    В реальном проекте здесь обычно формируется инвойс через Telegram Payments
-    (bot.send_invoice) либо ссылка на внешний платёжный сервис. Для простоты
-    и переносимости примера выводим информативное сообщение со ссылкой,
-    которую легко заменить на реальную интеграцию оплаты.
-    """
     text = (
-        "⭐ *PRO Подписка*\n\n"
-        "С PRO-подпиской Вы получаете:\n"
-        "• Безлимитные запросы к текстовой модели\n"
-        "• Приоритетную генерацию изображений без очереди\n"
-        "• Расширенный контекст памяти диалога\n\n"
-        f"Оформить подписку можно здесь: {PRO_LINK}"
+        f"📊 *Ваш тариф:* {brand}\n\n"
+        f"Сообщения: {user.get('messages_used', 0)}/{lim['messages']}\n"
+        f"Фото: {user.get('photos_used', 0)}/{lim['photos']}\n"
+        f"Генерации арта: {user.get('images_used', 0)}/{lim['images']}\n\n"
+        f"Сброс лимита через: {time_left_str(user)}"
     )
+    if tier == "pro" and user.get("pro_expires_at"):
+        days_left = int((user["pro_expires_at"] - time.time()) // 86400)
+        text += f"\nPRO активен ещё {days_left} дн."
     await message.answer(text, reply_markup=MAIN_KEYBOARD)
 
 
-@router.message(F.text == BTN_GENERATE_ART)
-async def handle_generate_art_button(message: Message) -> None:
-    """
-    Обрабатывает нажатие кнопки «🎨 Сгенерировать арт».
-
-    Бот не генерирует изображение немедленно (у нас ещё нет промпта), а переводит
-    сессию пользователя в режим ожидания промпта: следующее текстовое сообщение
-    будет интерпретировано как описание желаемой картинки (см. handle_text_message).
-    """
-    user_id = message.from_user.id if message.from_user else message.chat.id
-    session = get_session(user_id)
-    session.awaiting_art_prompt = True
-
+@router.message(F.text == BTN_PRO)
+async def handle_pro_button(message: Message) -> None:
     await message.answer(
-        "Отлично! Опишите, пожалуйста, что бы Вы хотели увидеть на картинке — "
-        "чем подробнее описание (стиль, цвета, композиция), тем точнее получится результат.",
+        "⭐ *PRO Подписка* — 100 сообщений, 30 фото и 10 генераций арта в сутки.\n\n"
+        "Выберите срок подписки:",
+        reply_markup=build_pro_plans_keyboard(),
+    )
+
+
+@router.callback_query(F.data.startswith("buy_pro:"))
+async def handle_buy_pro_callback(callback: CallbackQuery, bot: Bot) -> None:
+    """Пользователь выбрал срок подписки — выставляем инвойс в Telegram Stars."""
+    months = int(callback.data.split(":")[1])
+    plan = next((p for p in PRO_PLANS if p[0] == months), None)
+    if plan is None:
+        await callback.answer("Такой план не найден.", show_alert=True)
+        return
+
+    _, stars, label = plan
+    await bot.send_invoice(
+        chat_id=callback.message.chat.id,
+        title=f"{PRO_MODEL_BRAND} на {months} мес.",
+        description=f"Подписка PRO ({label.split('—')[0].strip()}) на {BOT_BRAND_NAME}",
+        payload=f"pro_{months}_{callback.from_user.id}",
+        provider_token="",       # для оплаты звёздами провайдер-токен не нужен
+        currency="XTR",
+        prices=[LabeledPrice(label=f"PRO на {months} мес.", amount=stars)],
+    )
+    await callback.answer()
+
+
+@router.pre_checkout_query()
+async def handle_pre_checkout(pre_checkout_query: PreCheckoutQuery) -> None:
+    """Подтверждаем готовность принять оплату (обязательный шаг Bot API)."""
+    await pre_checkout_query.answer(ok=True)
+
+
+@router.message(F.successful_payment)
+async def handle_successful_payment(message: Message) -> None:
+    """Обрабатывает подтверждённый платёж, активирует PRO-подписку."""
+    payload = message.successful_payment.invoice_payload
+    try:
+        _, months_str, user_id_str = payload.split("_")
+        months, user_id = int(months_str), int(user_id_str)
+    except (ValueError, AttributeError):
+        logger.error("Некорректный payload платежа: %s", payload)
+        return
+
+    new_expiry = await activate_pro(user_id, months)
+    expiry_date = time.strftime("%d.%m.%Y", time.localtime(new_expiry))
+    await message.answer(
+        f"✅ Оплата получена! {PRO_MODEL_BRAND} активирован до {expiry_date}.\n"
+        "Спасибо, что пользуетесь нашим ботом! 🙌",
+        reply_markup=MAIN_KEYBOARD,
+    )
+    logger.info("Пользователь %s оформил PRO на %d мес. (до %s)", user_id, months, expiry_date)
+
+
+@router.message(F.text == BTN_ART)
+async def handle_art_button(message: Message) -> None:
+    user_id = message.from_user.id
+    allowed, user, tier = await try_consume(user_id, "images")
+    if not allowed:
+        await message.answer(
+            f"Лимит генераций арта на тарифе {PRO_MODEL_BRAND if tier == 'pro' else FREE_MODEL_BRAND} исчерпан.\n"
+            f"Обновится через {time_left_str(user)}. "
+            + ("" if tier == "pro" else "Оформите PRO для увеличения лимита."),
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+    AWAITING_ART[user_id] = True
+    await message.answer(
+        "Опишите, пожалуйста, что бы Вы хотели увидеть на картинке — чем подробнее "
+        "(стиль, цвета, композиция), тем точнее результат.",
         reply_markup=MAIN_KEYBOARD,
     )
 
 
 @router.message(F.photo)
-async def handle_photo_message(message: Message, bot: Bot) -> None:
-    """
-    Обрабатывает входящие фотографии (мультимодальный ввод).
-
-    Telegram присылает фото в нескольких разрешениях — берём последний элемент
-    списка message.photo, так как он соответствует максимальному качеству.
-    Скачанные байты передаются в Gemini вместе с подписью пользователя
-    (caption) в качестве уточняющего промпта. Если подписи нет — используется
-    нейтральный промпт по умолчанию (см. ask_gemini_text).
-    """
-    user_id = message.from_user.id if message.from_user else message.chat.id
-    session = get_session(user_id)
-
-    await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-
-    largest_photo = message.photo[-1]
-    image_bytes = await download_photo_bytes(bot, largest_photo.file_id)
-
-    if image_bytes is None:
+async def handle_photo(message: Message, bot: Bot) -> None:
+    user_id = message.from_user.id
+    allowed, user, tier = await try_consume(user_id, "photos")
+    if not allowed:
         await message.answer(
-            "Не получилось загрузить это изображение (возможно, файл слишком большой "
-            "или произошла временная ошибка сети). Попробуйте отправить его ещё раз.",
+            f"Лимит на фото исчерпан. Обновится через {time_left_str(user)}. "
+            + ("" if tier == "pro" else "Оформите PRO для увеличения лимита."),
             reply_markup=MAIN_KEYBOARD,
         )
         return
 
-    caption = message.caption or ""
-    answer_text = await ask_gemini_text(session, user_text=caption, image_bytes=image_bytes)
+    await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+    image_bytes = await download_photo_bytes(bot, message.photo[-1].file_id)
+    if image_bytes is None:
+        await message.answer("Не получилось загрузить изображение. Попробуйте ещё раз.", reply_markup=MAIN_KEYBOARD)
+        return
 
-    await message.answer(answer_text, reply_markup=MAIN_KEYBOARD)
+    answer = await ask_gemini(user_id, tier, message.caption or "", image_bytes)
+    await message.answer(answer, reply_markup=MAIN_KEYBOARD)
 
 
 @router.message(F.text)
-async def handle_text_message(message: Message, bot: Bot) -> None:
-    """
-    Главный обработчик текстовых сообщений.
+async def handle_text(message: Message, bot: Bot) -> None:
+    user_id = message.from_user.id
+    text = message.text or ""
 
-    Порядок логики:
-        1. Если сессия пользователя находится в режиме «ожидание промпта для арта»
-           (после нажатия кнопки «🎨 Сгенерировать арт») — интерпретируем текущее
-           сообщение как промпт и запускаем генерацию изображения.
-        2. Иначе — это обычная реплика диалога, отправляем её в ask_gemini_text
-           и возвращаем текстовый ответ модели.
-
-    Индикатор "печатает…"/"отправляет фото…" показывается на всё время обработки,
-    чтобы пользователь видел, что бот активно работает над ответом.
-    """
-    user_id = message.from_user.id if message.from_user else message.chat.id
-    session = get_session(user_id)
-    user_text = message.text or ""
-
-    # --- Ветка 1: пользователь только что нажал «Сгенерировать арт» -----------------
-    if session.awaiting_art_prompt:
-        session.awaiting_art_prompt = False  # сбрасываем флаг сразу, чтобы избежать повторов
+    # Если пользователь ранее нажал "Сгенерировать арт" — этот текст является промптом.
+    if AWAITING_ART.get(user_id):
+        AWAITING_ART[user_id] = False
         await bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_PHOTO)
-
-        image_bytes = await generate_art_with_fallback(user_text)
-
+        image_bytes = await generate_art_with_fallback(text)
         if image_bytes is None:
             await message.answer(
-                "К сожалению, сейчас не удалось сгенерировать изображение (проблема на стороне "
-                "сервиса генерации). Пожалуйста, попробуйте ещё раз чуть позже или измените описание.",
+                "Не удалось сгенерировать изображение (сбой сервиса). Попробуйте ещё раз позже.",
                 reply_markup=MAIN_KEYBOARD,
             )
             return
-
-        photo_file = BufferedInputFile(image_bytes, filename="generated_art.png")
         await message.answer_photo(
-            photo=photo_file,
-            caption=f'Готово! Вот изображение по описанию: "{user_text}"',
+            photo=BufferedInputFile(image_bytes, filename="art.png"),
+            caption=f'Готово! По описанию: "{text}"',
             reply_markup=MAIN_KEYBOARD,
         )
         return
 
-    # --- Ветка 2: обычное текстовое сообщение в диалоге ------------------------------
+    allowed, user, tier = await try_consume(user_id, "messages")
+    if not allowed:
+        await message.answer(
+            f"Дневной лимит сообщений исчерпан. Обновится через {time_left_str(user)}. "
+            + ("" if tier == "pro" else "Оформите PRO для увеличения лимита."),
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+
     await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-    answer_text = await ask_gemini_text(session, user_text=user_text)
-    await message.answer(answer_text, reply_markup=MAIN_KEYBOARD)
+    answer = await ask_gemini(user_id, tier, text)
+    await message.answer(answer, reply_markup=MAIN_KEYBOARD)
 
 
 @router.message()
-async def handle_unsupported_content(message: Message) -> None:
-    """
-    Заглушка для любых иных типов сообщений (стикеры, голосовые, документы и т.п.),
-    которые явно не обрабатываются выше. Вежливо сообщаем пользователю, какие
-    форматы бот умеет обрабатывать, вместо того чтобы просто игнорировать сообщение.
-    """
-    await message.answer(
-        "Пока что я умею работать с текстом и изображениями. Пришлите, пожалуйста, "
-        "текстовое сообщение или фотографию.",
-        reply_markup=MAIN_KEYBOARD,
-    )
+async def handle_unsupported(message: Message) -> None:
+    await message.answer("Пока умею работать с текстом и изображениями.", reply_markup=MAIN_KEYBOARD)
 
 
 # ---------------------------------------------------------------------------------
-# БЛОК 11. AIOHTTP-СЕРВЕР ДЛЯ HEALTH-CHECK (НЕОБХОДИМ ДЛЯ RENDER)
+# HEALTH-CHECK СЕРВЕР (обязателен, чтобы Render не считал деплой упавшим)
 # ---------------------------------------------------------------------------------
-# Render (и аналогичные PaaS-платформы) ожидают, что веб-сервис будет слушать
-# указанный порт и отвечать на HTTP-запросы — иначе деплой считается "упавшим".
-# Поэтому параллельно с поллингом Telegram поднимаем лёгкий aiohttp-сервер.
-
-async def handle_health_check(request: web.Request) -> web.Response:
-    """Простой health-check эндпоинт: подтверждает, что процесс жив и отвечает."""
-    return web.json_response({"status": "ok", "service": "gemini-telegram-bot", "time": time.time()})
-
-
-def build_web_app() -> web.Application:
-    """Собирает минимальное aiohttp-приложение с единственным маршрутом '/'."""
-    app = web.Application()
-    app.router.add_get("/", handle_health_check)
-    app.router.add_get("/health", handle_health_check)
-    return app
+async def handle_health(_request: web.Request) -> web.Response:
+    return web.json_response({"status": "ok", "bot": BOT_BRAND_NAME, "time": time.time()})
 
 
 async def run_web_server() -> None:
-    """
-    Запускает aiohttp-сервер на порту PORT и держит его работающим бесконечно
-    (до отмены задачи извне). AppRunner/TCPSite — стандартный низкоуровневый
-    способ запустить aiohttp-приложение вручную внутри уже существующего
-    event loop, без блокирующего web.run_app().
-    """
-    app = build_web_app()
+    app = web.Application()
+    app.router.add_get("/", handle_health)
+    app.router.add_get("/health", handle_health)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
     await site.start()
     logger.info("Health-check сервер запущен на 0.0.0.0:%d", PORT)
-
-    # Бесконечно ждём — задача будет отменена извне при остановке приложения.
     try:
         while True:
             await asyncio.sleep(3600)
     except asyncio.CancelledError:
-        logger.info("Остановка health-check сервера…")
         await runner.cleanup()
         raise
 
 
 # ---------------------------------------------------------------------------------
-# БЛОК 12. ЗАПУСК ПОЛЛИНГА TELEGRAM-БОТА С ОТКАЗОУСТОЙЧИВЫМ ПЕРЕЗАПУСКОМ
+# ПОЛЛИНГ БОТА С АВТОПЕРЕЗАПУСКОМ ПРИ СБОЯХ
 # ---------------------------------------------------------------------------------
-
 async def run_bot_polling() -> None:
-    """
-    Запускает long-polling бота.
-
-    drop_pending_updates=True гарантирует, что после рестарта процесса (например,
-    из-за деплоя новой версии на Render) бот не станет "отвечать задним числом"
-    на сообщения, накопившиеся за время простоя — все pending-обновления
-    отбрасываются, и бот начинает обработку строго с текущего момента.
-
-    Обёрнуто в try/except с автоматическим перезапуском при сбое: если по любой
-    причине поллинг упадёт (сетевой сбой, временная недоступность Telegram API),
-    процесс не завершится, а через паузу попробует переподключиться заново —
-    это и есть требуемая отказоустойчивость главного блока.
-    """
-    bot = Bot(
-        token=TELEGRAM_BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN),
-    )
+    bot = Bot(token=TELEGRAM_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
     dispatcher = Dispatcher()
     dispatcher.include_router(router)
 
-    retry_delay_seconds = 5
-    max_retry_delay_seconds = 60
-
+    delay = 5
     while True:
         try:
-            logger.info("Запуск long-polling Telegram-бота…")
+            logger.info("Запуск long-polling %s…", BOT_BRAND_NAME)
             await dispatcher.start_polling(
                 bot,
                 drop_pending_updates=True,
                 allowed_updates=dispatcher.resolve_used_update_types(),
             )
-            # Если start_polling завершился штатно (например, через dispatcher.stop_polling()) —
-            # выходим из цикла без повторной попытки.
             break
-
         except asyncio.CancelledError:
-            logger.info("Поллинг бота остановлен по сигналу отмены задачи.")
             raise
-
-        except Exception as exc:  # noqa: BLE001 — здесь нужен максимально широкий перехват
-            logger.error(
-                "Поллинг бота упал с ошибкой: %s\n%s",
-                exc, traceback.format_exc(),
-            )
-            logger.info("Повторная попытка запуска через %d секунд…", retry_delay_seconds)
-            await asyncio.sleep(retry_delay_seconds)
-            # Экспоненциальное увеличение задержки между попытками, чтобы не "долбить"
-            # Telegram API слишком часто при затяжном сбое.
-            retry_delay_seconds = min(retry_delay_seconds * 2, max_retry_delay_seconds)
-
-        finally:
-            # На всякий случай закрываем HTTP-сессию бота при каждом выходе из цикла,
-            # чтобы не копить "зависшие" соединения при повторных попытках запуска.
-            pass
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Поллинг упал: %s\n%s", exc, traceback.format_exc())
+            logger.info("Повтор через %d сек…", delay)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 60)
 
     await bot.session.close()
 
 
 # ---------------------------------------------------------------------------------
-# БЛОК 13. ТОЧКА ВХОДА: ПАРАЛЛЕЛЬНЫЙ ЗАПУСК СЕРВЕРА И ПОЛЛИНГА
+# ТОЧКА ВХОДА
 # ---------------------------------------------------------------------------------
-
 async def main() -> None:
-    """
-    Главная асинхронная функция приложения.
-
-    Запускает две долгоживущие задачи параллельно через asyncio.gather:
-        1. run_web_server()  — health-check сервер для Render.
-        2. run_bot_polling() — сам Telegram-бот.
-
-    Если одна из задач завершится с исключением, asyncio.gather по умолчанию
-    пробрасывает исключение наверх — это осознанный выбор: если критический
-    компонент (например, веб-сервер, без которого Render считает деплой
-    неудачным) упал безвозвратно, лучше уронить весь процесс и дать
-    оркестратору (Render) перезапустить контейнер с чистого листа, чем
-    оставлять бота в "полуживом" состоянии.
-    """
-    logger.info("=" * 70)
-    logger.info("Запуск приложения: Telegram-бот + health-check сервер")
-    logger.info("Текстовая модель: %s | Vision-модель: %s", TEXT_MODEL_NAME, VISION_MODEL_NAME)
-    logger.info("Модель генерации арта (основная/резервная): %s / %s",
-                IMAGE_MODEL_PRIMARY, IMAGE_MODEL_FALLBACK)
-    logger.info("=" * 70)
-
-    await asyncio.gather(
-        run_web_server(),
-        run_bot_polling(),
-    )
+    logger.info("=" * 60)
+    logger.info("Запуск %s | Free: %s | Pro: %s | Vision: %s",
+                BOT_BRAND_NAME, TEXT_MODEL_BY_TIER["free"], TEXT_MODEL_BY_TIER["pro"], IMAGE_MODEL_PRIMARY)
+    logger.info("=" * 60)
+    await asyncio.gather(run_web_server(), run_bot_polling())
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        logger.info("Приложение остановлено пользователем или системой. До встречи!")
-    except Exception as exc:  # noqa: BLE001 — последний рубеж обороны перед падением процесса
-        logger.critical("Фатальная ошибка на верхнем уровне приложения: %s\n%s",
-                         exc, traceback.format_exc())
+        logger.info("Остановлено.")
+    except Exception as exc:  # noqa: BLE001
+        logger.critical("Фатальная ошибка: %s\n%s", exc, traceback.format_exc())
         sys.exit(1)
